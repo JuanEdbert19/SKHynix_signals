@@ -1,0 +1,9 @@
+pandas
+numpy
+pykrx
+statsmodels
+streamlit
+altair
+pyarrow
+pytest
+yfinance

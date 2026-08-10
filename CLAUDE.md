@@ -40,7 +40,78 @@ This is a quantitative research project, so correctness of the *method* matters 
 3. Align the two into one daily panel, with tweet counts attributed to the correct trading day.
 4. Look at the relationship between tweet count (and its changes/abnormality vs. a rolling baseline) and next-period returns, volatility, and volume.
 
-**Stack**: Python. Nothing chosen beyond that yet.
+**Stack**: Python 3.13 in `.venv`. pandas / numpy / statsmodels / pykrx / yfinance /
+streamlit / altair. `pip install -r requirements.txt`.
+
+### Testing Framework
+
+A signal-agnostic harness for the general question "does signal X predict SK Hynix
+price behaviour?" — built before any real signal exists so the tweet-source decision
+stops gating progress. Tweet counts, Google Trends and anything else all reduce to
+one number per trading day, which is the only interface it requires.
+
+| Module | Role |
+|---|---|
+| `quant/prices.py` | OHLCV for `000660` (pykrx) and KOSPI (`^KS11`, yfinance); parquet cache in `data/` |
+| `quant/align.py` | UTC signal timestamps → KRX trading date. **The only module with timezone logic** |
+| `quant/panel.py` | Forward-return targets and signal transforms |
+| `quant/signals.py` | Signal registry + the three validation fixtures |
+| `quant/stats.py` | Rank IC, quantile buckets, Newey-West regressions, reverse causality |
+| `scripts/run_test.py` | CLI; writes a JSON record to `results/` |
+| `app.py` | Streamlit dashboard — a thin caller of the same functions, so it cannot drift |
+
+**Adding a real signal**: write a function `(px, kospi) -> Series` keyed by trading
+date, register it in `SIGNALS`, and set its `DEFAULT_TRANSFORM` (`"zscore"` for
+count-style signals). If it arrives as UTC timestamps, run it through
+`align.align_to_trading_days` first. Nothing else changes.
+
+**Primary specification** — fix this before looking, to keep specification search
+honest: `zscore` transform, `fwd_ret` target (raw), horizon 3. Everything else is
+explicitly secondary.
+
+**Deliberately narrow output.** Phase 1 reports rank IC, HAC t, HAC p, the
+top-minus-bottom quintile spread, n, the quintile table and the reverse-causality
+panel — nothing else. Scope was cut on 2026-08-10 (developer's call) by removing the
+multi-horizon grid, the Bonferroni threshold, `coef`, `t_ols_naive`, the cumulative
+long-short curve, the `fwd_vol` / `fwd_volrat` targets and the `diff` / `logdiff` /
+`pctrank` transforms. Two targets remain (`fwd_ret`, `fwd_exret`) and two transforms
+(`raw`, `zscore`). `stats.evaluate` replaced `stats.horizon_grid` and returns a dict
+for a single specification. Consequences worth knowing before re-adding anything:
+
+- Bonferroni went with the horizon grid and is *not* an oversight — one fixed
+  specification means one test. If multi-horizon ever returns, the correction has to
+  return with it.
+- Dropping `fwd_vol`/`fwd_volrat` removes the targets where attention data most
+  plausibly shows an effect (volume and turbulence rather than direction). If tweet
+  counts read null on returns, this is the first thing to add back.
+- `ols_hac` still computes `coef` and `se_ols` internally; they are used by
+  `long_short` and by the HAC-correction tests, just not displayed.
+
+#### Non-obvious things learned building it
+
+- **HAC inflation needs a *persistent signal*, not just an overlapping target.**
+  Newey-West acts on the autocovariance of signal × residual, so a near-iid signal
+  barely moves even at h=10 (se ratio 1.13) while an AR(0.8) signal inflates 2.2×.
+  Real attention signals are sticky, so the correction will matter — but do not
+  expect to see it with a synthetic iid signal. Pinned by tests.
+- **`ols_hac(y, x)` argument order is load-bearing and a swap is nearly invisible.**
+  Plain-OLS t is exactly symmetric under swapping y and x in a bivariate regression;
+  under HAC the t merely changes to another plausible value (7.5 → 4.6 on `planted`),
+  and rank IC is unchanged either way. The coefficient is the only clear tell — it
+  rescales by 1/σ(return) ≈ 30×. This bug was shipped and caught only by hand-checking
+  that magnitude. **`coef` is no longer reported**, so the guard moved into the test
+  suite: `test_evaluate_regresses_return_on_signal_not_the_reverse` monkeypatches
+  `stats.ols_hac` and asserts the first call is `(fwd_ret_3, signal)`. Nothing in the
+  output would catch a reintroduction.
+- **`rank_ic` deliberately returns no p-value.** A Spearman p-value assumes
+  independent observations, which overlapping forward returns are not. All inference
+  routes through `ols_hac`.
+- **pykrx's index endpoint requires KRX login** (`KRX_ID`/`KRX_PW`) and fails without
+  it, so the KOSPI comes from yfinance `^KS11` instead. The stock OHLCV endpoint still
+  works without auth.
+- **`pd.Timedelta("15h30m")` emits a numpy DeprecationWarning** under numpy 2; use
+  `pd.to_timedelta(..., unit="m")`.
+- Streamlit's `st.info(icon=...)` accepts only real emoji, not shapes like `○`.
 
 ### Open Questions
 
@@ -56,9 +127,21 @@ lives in `data-sources.md`; read it before proposing anything here.
 
 ### Status
 
-- Nothing implemented yet. No data source chosen.
+- **Testing framework: built and validated.** `pytest` (24 tests) passes; the network
+  price cross-check passes under `pytest -m slow`. Price data is live: 1,865 trading
+  days of SK Hynix, 2019-01-02 → 2026-08-06.
+- **Framework validation results** at the primary spec, h=3 (reproduce with
+  `scripts/run_test.py --signal <name>`): `noise` reads null (IC −0.028, p = 0.62);
+  `planted` (ρ=0.15 fixture) is detected with IC 0.168, HAC t = 7.51, and a monotone
+  quintile ramp; `past_return` shows no forward predictability (p = 0.52) but fires
+  hard on the reverse-causality check (t = 17.9) as designed. The harness
+  distinguishes signal from noise. `test_planted_strongest_at_its_own_horizon` still
+  confirms the fixture peaks at h=3 across 1/3/5/10, even though the CLI no longer
+  scans horizons.
+- **No real signal implemented.** No tweet source chosen — that decision is still
+  blocked on the base-rate probe in `data-sources.md`.
 - `data-sources.md` — evaluation of tweet-count sources only, with whether each can yield a raw tweet count. Analysis only; no decisions made. Deliberately excludes sentiment/media-analytics vendors, price data, and attention proxies.
-- `price-data.md` — OHLCV source options for `000660.KS` and KOSPI. pykrx recommended; not yet implemented.
+- `price-data.md` — OHLCV source options for `000660.KS` and KOSPI. Implemented; note the pykrx index-endpoint limitation recorded there.
 
 ## Maintenance Rule
 

@@ -1,0 +1,333 @@
+"""Acceptance criteria for the testing framework.
+
+These are not unit tests for coverage's sake. They are the checks that decide
+whether a null result on a real signal means "no effect" or "broken pipeline".
+Tests run against a synthetic price series so they need no network.
+"""
+
+import sys
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import pytest
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+
+from quant import align, panel, signals, stats  # noqa: E402
+
+N_DAYS = 1200
+
+
+def fake_px(seed=42, n=N_DAYS):
+    """A random-walk price series on a business-day calendar."""
+    rng = np.random.default_rng(seed)
+    idx = pd.bdate_range("2019-01-02", periods=n, name="date")
+    ret = rng.standard_normal(n) * 0.02
+    close = 100 * np.exp(np.cumsum(ret))
+    return pd.DataFrame({
+        "open": close, "high": close * 1.01, "low": close * 0.99,
+        "close": close,
+        "volume": rng.lognormal(15, 0.4, n),
+    }, index=idx)
+
+
+def build(sig_name, seed=0, transform="raw", px=None, horizon=3):
+    px = fake_px() if px is None else px
+    sig = signals.SIGNALS[sig_name](px, None, **({"seed": seed} if sig_name != "past_return" else {}))
+    return panel.build_panel(px, sig, transform_kind=transform, horizon=horizon)
+
+
+# --- false positives: noise must read null ----------------------------------
+
+
+def test_noise_false_positive_rate():
+    """Across many seeds, noise should clear p<0.05 about 5% of the time.
+
+    If HAC is misconfigured the rate blows out well past nominal, which is
+    exactly what this catches.
+    """
+    hits = 0
+    trials = 40
+    for seed in range(trials):
+        pnl = build("noise", seed=seed)
+        res = stats.ols_hac(pnl["fwd_ret_3"], pnl["signal"], maxlags=3)
+        hits += res["p"] < 0.05
+
+    rate = hits / trials
+    assert rate <= 0.20, f"false positive rate {rate:.2f} far above nominal 0.05"
+
+
+def test_noise_ic_near_zero():
+    pnl = build("noise", seed=7)
+    assert abs(stats.rank_ic(pnl["signal"], pnl["fwd_ret_3"])) < 0.08
+
+
+# --- false negatives: planted must be detected ------------------------------
+
+
+def test_planted_detected_at_target_horizon():
+    """The framework must see a known rho=0.15 effect at h=3."""
+    pnl = build("planted", seed=0)
+    ic = stats.rank_ic(pnl["signal"], pnl["fwd_ret_3"])
+    res = stats.ols_hac(pnl["fwd_ret_3"], pnl["signal"], maxlags=3)
+
+    assert ic > 0, f"planted signal detected with wrong sign (ic={ic:.3f})"
+    assert abs(ic - signals.PLANTED_RHO) < 0.07, f"ic {ic:.3f} far from planted 0.15"
+    assert res["p"] < 0.05, f"known effect not detected (p={res['p']:.3f})"
+
+
+def test_planted_strongest_at_its_own_horizon():
+    """The fixture must peak at the horizon it was built from, not elsewhere.
+
+    Kept even though the harness now tests a single fixed horizon: it is what
+    confirms the machinery localises an effect in time rather than smearing it.
+    """
+    px = fake_px()
+    ics = {}
+    for h in (1, 3, 5, 10):
+        pnl = build("planted", seed=0, px=px, horizon=h)
+        ics[h] = stats.rank_ic(pnl["signal"], pnl[f"fwd_ret_{h}"])
+
+    best = max(ics, key=ics.get)
+    assert best == signals.PLANTED_HORIZON, f"peak IC at h={best}, expected 3"
+
+
+def test_planted_long_short_spread_positive():
+    pnl = build("planted", seed=0)
+    ls = stats.long_short(pnl["signal"], pnl["fwd_ret_3"], maxlags=3)
+    assert ls["spread"] > 0 and ls["t"] > 1.5
+
+
+# --- HAC actually corrects --------------------------------------------------
+
+
+def _ar1(phi, index, seed=5):
+    rng = np.random.default_rng(seed)
+    x = np.zeros(len(index))
+    for i in range(1, len(x)):
+        x[i] = phi * x[i - 1] + rng.standard_normal()
+    return pd.Series(x, index=index)
+
+
+def test_hac_inflates_se_for_persistent_signal_on_overlapping_target():
+    """A persistent signal against an overlapping target must inflate the SE.
+
+    This is the configuration that matters in practice: attention signals are
+    sticky, so their HAC correction is large. Catches a silently ignored
+    cov_type, which would leave every t-stat in the project overstated.
+    """
+    px = fake_px()
+    pnl = panel.add_targets(px, horizon=3)
+    sig = _ar1(0.8, px.index)
+
+    res = stats.ols_hac(pnl["fwd_ret_3"], sig, maxlags=3)
+    assert res["se"] > res["se_ols"] * 1.20, (
+        f"HAC se {res['se']:.5f} not meaningfully above OLS se {res['se_ols']:.5f}"
+    )
+
+
+def test_hac_correction_grows_with_horizon():
+    px = fake_px()
+    sig = _ar1(0.8, px.index)
+
+    ratios = []
+    for h in (1, 3, 10):
+        fwd = panel.add_targets(px, horizon=h)[f"fwd_ret_{h}"]
+        res = stats.ols_hac(fwd, sig, maxlags=h)
+        ratios.append(res["se"] / res["se_ols"])
+    assert ratios[0] < ratios[1] < ratios[2], f"non-monotonic correction: {ratios}"
+
+
+def test_hac_correction_is_small_for_serially_uncorrelated_signal():
+    """Overlap alone does NOT inflate the SE — the signal must be persistent too.
+
+    Pinning this down because it is counter-intuitive: the Newey-West correction
+    acts on the autocovariance of signal x residual, so a near-iid signal barely
+    moves even when the target windows overlap heavily. Any real count-based
+    signal will be persistent, so the correction will matter there.
+    """
+    px = fake_px()
+    pnl = panel.add_targets(px, horizon=3)
+    sig = _ar1(0.0, px.index)
+
+    res = stats.ols_hac(pnl["fwd_ret_3"], sig, maxlags=3)
+    assert 0.9 < res["se"] / res["se_ols"] < 1.1
+
+
+def test_evaluate_regresses_return_on_signal_not_the_reverse(monkeypatch):
+    """The forward return must be the dependent variable.
+
+    A swap leaves rank IC identical and still yields a plausible HAC t (7.5 vs
+    4.6 on the planted fixture), so nothing `evaluate` returns identifies which
+    direction was run. This bug was shipped once and was caught only by the
+    coefficient magnitude, which is no longer reported. The check therefore
+    inspects the call arguments directly rather than anything downstream.
+    """
+    pnl = build("planted", seed=0)
+    seen = {}
+    real = stats.ols_hac
+
+    def spy(y, x, *a, **k):
+        seen.setdefault("first_call", (y.name, x.name))
+        return real(y, x, *a, **k)
+
+    monkeypatch.setattr(stats, "ols_hac", spy)
+    stats.evaluate(pnl, horizon=3)
+
+    assert seen["first_call"] == ("fwd_ret_3", "signal"), (
+        f"regressed {seen['first_call'][0]} on {seen['first_call'][1]} — reversed"
+    )
+    # A per-1sd coefficient on a daily log return must be of return magnitude.
+    assert abs(real(pnl["fwd_ret_3"], pnl["signal"], maxlags=3)["coef"]) < 0.05
+
+
+def test_hac_and_ols_agree_on_non_overlapping_target():
+    """At h=1 there is no overlap, so the correction should be small."""
+    pnl = build("noise", seed=3, horizon=1)
+    res = stats.ols_hac(pnl["fwd_ret_1"], pnl["signal"], maxlags=1)
+    assert res["se"] < res["se_ols"] * 1.5
+
+
+# --- no look-ahead in transforms -------------------------------------------
+
+
+@pytest.mark.parametrize("kind", panel.TRANSFORMS)
+def test_transform_uses_no_future_data(kind):
+    """Truncating the input after day t must not change the value at day t."""
+    rng = np.random.default_rng(11)
+    idx = pd.bdate_range("2020-01-01", periods=600)
+    sig = pd.Series(rng.lognormal(3, 0.5, 600), index=idx)
+
+    cut = 400
+    full = panel.transform(sig, kind=kind)
+    truncated = panel.transform(sig.iloc[: cut + 1], kind=kind)
+
+    a, b = full.iloc[cut], truncated.iloc[cut]
+    assert np.isclose(a, b, equal_nan=True), (
+        f"{kind} leaks future data: {a} with full series vs {b} truncated at t"
+    )
+
+
+def test_zscore_baseline_excludes_today():
+    """A single spike must not damp its own z-score by entering the baseline."""
+    idx = pd.bdate_range("2020-01-01", periods=60)
+    sig = pd.Series(1.0, index=idx)
+    sig.iloc[-1] = 100.0
+    # Constant history has zero std, so a correct implementation yields inf/NaN
+    # rather than a finite value computed from a baseline containing the spike.
+    z = panel.transform(sig, kind="zscore", window=20)
+    assert not np.isfinite(z.iloc[-1])
+
+
+# --- targets are arithmetically what they claim ----------------------------
+
+
+def test_forward_return_matches_hand_calculation():
+    px = fake_px()
+    pnl = panel.add_targets(px, horizon=3)
+    i = 500
+    expected = np.log(px["close"].iloc[i + 3] / px["close"].iloc[i])
+    assert np.isclose(pnl["fwd_ret_3"].iloc[i], expected)
+
+
+def test_forward_return_tail_is_nan():
+    """The last h rows cannot have a forward return."""
+    pnl = panel.add_targets(fake_px(), horizon=3)
+    assert pnl["fwd_ret_3"].iloc[-3:].isna().all()
+
+
+def test_excess_return_removes_market():
+    """If the stock IS the market, the excess return must be zero."""
+    px = fake_px()
+    pnl = panel.add_targets(px, kospi=px, horizon=3)
+    assert pnl["fwd_exret_3"].abs().max() < 1e-10
+
+
+# --- alignment -------------------------------------------------------------
+
+
+def _trading_days():
+    # A Mon-Fri week, with Wed 2024-01-03 removed to stand in for a holiday.
+    days = pd.DatetimeIndex(["2024-01-01", "2024-01-02", "2024-01-04",
+                             "2024-01-05", "2024-01-08", "2024-01-09"])
+    return days
+
+
+def _aligned(timestamps_kst, values=None, agg="sum"):
+    idx = pd.DatetimeIndex(timestamps_kst).tz_localize("Asia/Seoul").tz_convert("UTC")
+    sig = pd.Series(values if values is not None else [1.0] * len(idx), index=idx)
+    return align.align_to_trading_days(sig, _trading_days(), agg=agg)
+
+
+def test_before_close_lands_on_same_day():
+    out = _aligned(["2024-01-05 15:29"])
+    assert out.loc["2024-01-05"] == 1.0
+
+
+def test_at_close_lands_on_same_day():
+    out = _aligned(["2024-01-05 15:30"])
+    assert out.loc["2024-01-05"] == 1.0
+
+
+def test_one_minute_after_close_lands_on_next_trading_day():
+    out = _aligned(["2024-01-05 15:31"])
+    assert np.isnan(out.loc["2024-01-05"]) or out.loc["2024-01-05"] == 0
+    assert out.loc["2024-01-08"] == 1.0
+
+
+def test_weekend_accumulates_into_next_session():
+    out = _aligned(["2024-01-06 10:00", "2024-01-07 22:00", "2024-01-08 09:00"])
+    assert out.loc["2024-01-08"] == 3.0
+
+
+def test_holiday_accumulates_into_next_session():
+    """2024-01-03 is absent from the calendar; its activity belongs to the 4th."""
+    out = _aligned(["2024-01-03 11:00", "2024-01-04 10:00"])
+    assert out.loc["2024-01-04"] == 2.0
+
+
+def test_utc_timestamp_near_midnight_kst_maps_correctly():
+    """23:00 UTC on the 4th is 08:00 KST on the 5th — before the 5th's close."""
+    idx = pd.DatetimeIndex(["2024-01-04 23:00"]).tz_localize("UTC")
+    out = align.align_to_trading_days(pd.Series([1.0], index=idx), _trading_days())
+    assert out.loc["2024-01-05"] == 1.0
+
+
+def test_mean_aggregation():
+    out = _aligned(["2024-01-06 10:00", "2024-01-07 10:00"], values=[2.0, 4.0],
+                   agg="mean")
+    assert out.loc["2024-01-08"] == 3.0
+
+
+def test_naive_index_passes_through():
+    days = _trading_days()
+    sig = pd.Series(range(len(days)), index=days, dtype=float)
+    out = align.align_to_trading_days(sig, days)
+    pd.testing.assert_series_equal(out, sig)
+
+
+# --- price cross-check (network) -------------------------------------------
+
+
+@pytest.mark.slow
+def test_pykrx_matches_yfinance():
+    """Sanity-check the price source against an independent one, once."""
+    import yfinance as yf
+
+    from quant import prices
+
+    px = prices.load_prices(start="2024-01-01", end="2024-12-31")
+    yf_px = yf.download("000660.KS", start="2024-01-01", end="2024-12-31",
+                        progress=False, auto_adjust=False)
+    yclose = yf_px["Close"].squeeze()
+    yclose.index = pd.DatetimeIndex(yclose.index).tz_localize(None).normalize()
+
+    common = px.index.intersection(yclose.index)
+    assert len(common) > 200, f"only {len(common)} overlapping days"
+
+    rng = np.random.default_rng(0)
+    sample = common[rng.choice(len(common), 20, replace=False)]
+    diff = (px.loc[sample, "close"] - yclose.loc[sample]).abs() / yclose.loc[sample]
+    assert diff.max() < 0.01, f"close prices disagree by up to {diff.max():.2%}"
