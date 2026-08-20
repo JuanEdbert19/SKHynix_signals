@@ -430,12 +430,9 @@ def test_missing_pageview_day_is_nan_not_zero(tmp_path):
     assert got.iloc[0] == 5.0
 
 
-def test_wiki_signals_registered_with_count_conventions():
-    """Count-style signals must aggregate by sum and default to zscore."""
+def test_wiki_signals_are_registered():
     for name in ("wiki_hynix", "wiki_semi", "wiki_hbm"):
         assert name in signals.SIGNALS
-        assert signals.SIGNAL_AGG[name] == "sum"
-        assert signals.DEFAULT_TRANSFORM[name] == "zscore"
 
 
 @pytest.mark.slow
@@ -445,3 +442,74 @@ def test_pageviews_fetch_is_live_and_complete():
     assert s.notna().all()
     assert s.index[-1] == pd.Timestamp("2024-03-31")
     assert (s > 0).all()
+
+
+# --- dow_zscore: the day-of-week baseline -----------------------------------
+
+
+def _weekly_cycle(n=120, monday_multiple=10.0, seed=1):
+    """A series with a strong Monday level effect and ordinary daily noise.
+
+    Noise matters: a perfectly constant series has zero rolling std, which the
+    transform maps to NaN, so the tests would pass vacuously.
+    """
+    idx = pd.bdate_range("2024-01-01", periods=n, name="date")
+    rng = np.random.default_rng(seed)
+    level = np.where(idx.dayofweek == 0, monday_multiple, 1.0) * 100
+    return pd.Series(level * rng.lognormal(0, 0.15, n), index=idx)
+
+
+def test_dow_zscore_compares_against_the_same_weekday():
+    """Baseline for a Monday is the preceding Mondays, not the preceding 20 days.
+
+    With Mondays 10x every other day, a plain z-score calls every Monday
+    abnormal. dow_zscore should call them ordinary — because they are ordinary
+    *for a Monday*.
+    """
+    s = _weekly_cycle()
+    plain = panel.transform(s, "zscore", window=20).dropna()
+    dow = panel.transform(s, "dow_zscore", window=20).dropna()
+
+    # Medians, not means: a 4-observation std occasionally collapses and throws
+    # a huge z, which drags a mean around without saying anything about bias.
+    assert plain[plain.index.dayofweek == 0].median() > 1.5
+    assert abs(dow[dow.index.dayofweek == 0].median()) < 0.5
+    # and no weekday is systematically favoured
+    assert dow.groupby(dow.index.dayofweek).median().abs().max() < 0.5
+
+
+def test_dow_zscore_still_detects_a_genuine_spike():
+    """Flattening the weekday cycle must not flatten real news."""
+    s = _weekly_cycle()
+    spike = s.index[80]
+    s.loc[spike] *= 4                            # a real 4x jump
+
+    dow = panel.transform(s, "dow_zscore", window=20)
+    assert dow[spike] > 2.0
+    assert dow[spike] > dow.drop(spike).abs().max()
+
+
+def test_dow_zscore_removes_the_monday_bias_on_real_signal_shape():
+    """The artifact this transform exists for.
+
+    Monday accumulates a weekend, so under a mixed baseline it dominates the
+    top quintile. Asserted on the same statistic quoted in CLAUDE.md.
+    """
+    idx = pd.bdate_range("2020-01-01", periods=600, name="date")
+    rng = np.random.default_rng(3)
+    base = np.where(idx.dayofweek == 0, 3.0, 1.0) * 400
+    s = pd.Series(base * rng.lognormal(0, 0.25, len(idx)), index=idx)
+
+    def monday_share(z):
+        z = z.dropna()
+        return (z[z >= z.quantile(0.8)].index.dayofweek == 0).mean()
+
+    assert monday_share(panel.transform(s, "zscore", 20)) > 0.60
+    assert 0.10 < monday_share(panel.transform(s, "dow_zscore", 20)) < 0.32
+
+
+def test_wiki_signals_use_mean_and_dow_zscore():
+    """Neither setting fixes the weekday artifact alone; both are required."""
+    for name in ("wiki_hynix", "wiki_semi", "wiki_hbm"):
+        assert signals.SIGNAL_AGG[name] == "mean"
+        assert signals.DEFAULT_TRANSFORM[name] == "dow_zscore"

@@ -39,8 +39,9 @@ def transform(sig, kind="zscore", window=20):
     """Apply a stationarity transform to a raw signal series.
 
     kind:
-      raw      as-is, for signals that are already stationary
-      zscore   abnormality vs a rolling baseline that EXCLUDES today
+      raw          as-is, for signals that are already stationary
+      zscore       abnormality vs a rolling baseline that EXCLUDES today
+      dow_zscore   same, but the baseline is the same weekday only
     """
     if kind == "raw":
         return sig.astype(float)
@@ -50,10 +51,28 @@ def transform(sig, kind="zscore", window=20):
         base = sig.rolling(window).mean().shift(1)
         sd = sig.rolling(window).std().shift(1)
         return (sig - base) / sd.replace(0.0, np.nan)
+    if kind == "dow_zscore":
+        # For a signal accumulated between market closes, Monday's bucket spans
+        # the weekend while Tuesday's spans one day. Against a mixed baseline
+        # Monday clears the bar nearly every week: with plain zscore, 83.5% of
+        # top-quintile days were Mondays (20% would be neutral) and mean z by
+        # weekday ranged over 2.09. Comparing each weekday only against recent
+        # values of the same weekday removes that; the same measurements come
+        # back at 19.5% and 0.35.
+        #
+        # window is in trading days, so window // 5 same-weekday observations
+        # span the same calendar period as the plain zscore baseline.
+        n = max(window // 5, 2)
+        out = {}
+        for _, g in sig.groupby(sig.index.dayofweek):
+            base = g.rolling(n).mean().shift(1)
+            sd = g.rolling(n).std().shift(1)
+            out[_] = (g - base) / sd.replace(0.0, np.nan)
+        return pd.concat(out.values()).sort_index()
     raise ValueError(f"unknown transform: {kind}")
 
 
-TRANSFORMS = ("raw", "zscore")
+TRANSFORMS = ("raw", "zscore", "dow_zscore")
 
 
 def build_panel(px, sig, transform_kind="zscore", window=20, kospi=None,

@@ -99,16 +99,22 @@ SIGNALS = {
 }
 
 # Counts are aggregated by sum when aligned; level-like signals by mean.
+#
+# The pageview signals use "mean" despite being counts. Summing makes Monday's
+# bucket (Fri+Sat+Sun) 2.3x every other day, which is a property of the calendar
+# rather than of attention. Mean gives average daily attention since the last
+# close, which is comparable across weekdays. Paired with the dow_zscore
+# transform below - neither fixes the artifact alone.
 SIGNAL_AGG = {"noise": "mean", "planted": "mean", "past_return": "mean",
-              "wiki_hynix": "sum", "wiki_semi": "sum", "wiki_hbm": "sum"}
+              "wiki_hynix": "mean", "wiki_semi": "mean", "wiki_hbm": "mean"}
 
 # The three fixtures are already stationary, so their natural transform is the
 # identity. Count-style signals (tweet volume, search volume) should default to
 # "zscore" — abnormality vs a rolling baseline — because raw counts on a growing
 # platform are non-stationary enough to produce a trend that looks like signal.
 DEFAULT_TRANSFORM = {"noise": "raw", "planted": "raw", "past_return": "raw",
-                     "wiki_hynix": "zscore", "wiki_semi": "zscore",
-                     "wiki_hbm": "zscore"}
+                     "wiki_hynix": "dow_zscore", "wiki_semi": "dow_zscore",
+                     "wiki_hbm": "dow_zscore"}
 
 
 def load_signal(name, px, kospi=None, **kwargs):
