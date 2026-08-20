@@ -15,7 +15,7 @@ import pytest
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from quant import align, panel, signals, stats  # noqa: E402
+from quant import align, cache, panel, signals, stats, wiki  # noqa: E402
 
 N_DAYS = 1200
 
@@ -35,7 +35,8 @@ def fake_px(seed=42, n=N_DAYS):
 
 def build(sig_name, seed=0, transform="raw", px=None, horizon=3):
     px = fake_px() if px is None else px
-    sig = signals.SIGNALS[sig_name](px, None, **({"seed": seed} if sig_name != "past_return" else {}))
+    seeded = sig_name in ("noise", "planted")
+    sig = signals.SIGNALS[sig_name](px, None, **({"seed": seed} if seeded else {}))
     return panel.build_panel(px, sig, transform_kind=transform, horizon=horizon)
 
 
@@ -331,3 +332,116 @@ def test_pykrx_matches_yfinance():
     sample = common[rng.choice(len(common), 20, replace=False)]
     diff = (px.loc[sample, "close"] - yclose.loc[sample]).abs() / yclose.loc[sample]
     assert diff.max() < 0.01, f"close prices disagree by up to {diff.max():.2%}"
+
+
+# --- Wikipedia pageviews: UTC day -> trading day ----------------------------
+
+
+def _pv(dates, views):
+    """A daily pageview series keyed by UTC calendar date."""
+    return pd.Series(views, index=pd.DatetimeIndex(dates), dtype="float64",
+                     name="pv")
+
+
+def test_daily_utc_stamped_at_the_close_of_its_own_day():
+    """A UTC day's count is stamped 00:00 UTC of the NEXT day.
+
+    That is the first instant the day's total exists. Anything earlier would be
+    claiming knowledge of views that had not happened yet.
+    """
+    out = align.daily_utc_to_timestamps(_pv(["2024-01-10"], [7.0]))
+    assert out.index[0] == pd.Timestamp("2024-01-11 00:00", tz="UTC")
+    assert out.iloc[0] == 7.0
+
+
+def test_pageviews_land_on_the_next_trading_day_not_the_same_one():
+    """The load-bearing +1 day in daily_utc_to_timestamps.
+
+    Without it, UTC day D lands on trading day D, so a count covering all 24h of
+    D — 17.5h of which fall after the 06:30 UTC close — would be used to predict
+    D's own forward return. Nothing in the output would show it; results would
+    simply look better. Remove the `+ pd.to_timedelta(1, unit="D")` and this fails.
+    """
+    days = pd.DatetimeIndex(["2024-01-09", "2024-01-10", "2024-01-11"])
+    out = align.align_to_trading_days(
+        align.daily_utc_to_timestamps(_pv(["2024-01-09", "2024-01-10"], [5.0, 9.0])),
+        days, agg="sum",
+    )
+    assert out["2024-01-10"] == 5.0    # views from the 9th
+    assert out["2024-01-11"] == 9.0    # views from the 10th
+    assert np.isnan(out["2024-01-09"]) # nothing known before the window starts
+
+
+def test_weekend_pageviews_accumulate_into_monday():
+    """Fri/Sat/Sun UTC days are all first tradeable at Monday's close."""
+    days = pd.DatetimeIndex(["2024-01-11", "2024-01-12", "2024-01-15"])  # Thu Fri Mon
+    out = align.align_to_trading_days(
+        align.daily_utc_to_timestamps(
+            _pv(["2024-01-12", "2024-01-13", "2024-01-14"], [1.0, 2.0, 4.0])),
+        days, agg="sum",
+    )
+    assert out["2024-01-15"] == 7.0
+
+
+def test_holiday_pageviews_accumulate_into_next_session():
+    """A gap in the trading calendar rolls its pageviews forward, not away."""
+    days = pd.DatetimeIndex(["2024-02-08", "2024-02-13"])  # Seollal closure between
+    out = align.align_to_trading_days(
+        align.daily_utc_to_timestamps(
+            _pv(["2024-02-09", "2024-02-10", "2024-02-11"], [3.0, 3.0, 3.0])),
+        days, agg="sum",
+    )
+    assert out["2024-02-13"] == 9.0
+
+
+def test_pageview_signal_matches_previous_utc_day(monkeypatch, tmp_path):
+    """End to end through signals.wiki_hynix, with the fetch stubbed out.
+
+    Asserts the identity the whole design rests on: the signal on trading day t
+    is the pageview count of the UTC day before t.
+    """
+    px = fake_px(n=40)
+    raw = pd.Series(
+        np.arange(len(px) + 40, dtype="float64"),
+        index=pd.date_range(px.index[0] - pd.to_timedelta(20, unit="D"), periods=len(px) + 40,
+                            freq="D"),
+    )
+    monkeypatch.setattr(wiki, "load_pageviews", lambda key, start, end: raw.rename(key))
+
+    sig = signals.SIGNALS["wiki_hynix"](px, None)
+    t = px.index[10]
+    prev = t - pd.to_timedelta(1, unit="D")
+    if t.dayofweek == 0:                       # Monday sums Fri+Sat+Sun
+        expected = raw[t - pd.to_timedelta(3, unit="D"):prev].sum()
+    else:
+        expected = raw[prev]
+    assert sig[t] == expected
+    assert sig.name == "wiki_hynix"
+
+
+def test_missing_pageview_day_is_nan_not_zero(tmp_path):
+    """An API gap must not read as 'nobody looked at the article'."""
+    def fetch():
+        idx = pd.date_range("2024-01-01", periods=3, freq="D")
+        return pd.Series([5.0, np.nan, 7.0], index=idx).to_frame("views")
+
+    got = cache.cached(tmp_path / "pv.parquet", fetch)["views"]
+    assert np.isnan(got.iloc[1])
+    assert got.iloc[0] == 5.0
+
+
+def test_wiki_signals_registered_with_count_conventions():
+    """Count-style signals must aggregate by sum and default to zscore."""
+    for name in ("wiki_hynix", "wiki_semi", "wiki_hbm"):
+        assert name in signals.SIGNALS
+        assert signals.SIGNAL_AGG[name] == "sum"
+        assert signals.DEFAULT_TRANSFORM[name] == "zscore"
+
+
+@pytest.mark.slow
+def test_pageviews_fetch_is_live_and_complete():
+    """The real API returns every calendar day in the window."""
+    s = wiki.load_pageviews("hynix", "2024-01-01", "2024-03-31")
+    assert s.notna().all()
+    assert s.index[-1] == pd.Timestamp("2024-03-31")
+    assert (s > 0).all()

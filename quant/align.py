@@ -26,6 +26,24 @@ def session_closes(trading_days):
     return naive.tz_localize(KST).tz_convert("UTC")
 
 
+def daily_utc_to_timestamps(sig):
+    """A series keyed by UTC calendar date -> tz-aware timestamps at each day's
+    closing edge, ready for align_to_trading_days.
+
+    A daily count covers 00:00-24:00 UTC, so it is not knowable until the day
+    ends. Stamping it at 00:00 UTC of the *next* day is therefore the earliest
+    instant it could be acted on, and align_to_trading_days then attributes UTC
+    day D to trading day D+1 (or the next session after a weekend or holiday).
+
+    The +1 day is load-bearing. Without it, UTC day D is stamped inside day D and
+    lands on trading day D — attributing a full 24h count, 17.5h of which occur
+    after the 06:30 UTC close, to a day whose forward return it then predicts.
+    That is look-ahead, and nothing downstream would reveal it.
+    """
+    idx = pd.DatetimeIndex(sig.index).tz_localize("UTC") + pd.to_timedelta(1, unit="D")
+    return pd.Series(sig.to_numpy(), index=idx, name=sig.name)
+
+
 def align_to_trading_days(sig, trading_days, agg="sum"):
     """Aggregate a UTC-timestamped signal onto the KRX trading calendar.
 

@@ -5,11 +5,9 @@ trading dates (KST). That is the join key for the whole project — signals are
 mapped onto it by quant.align, which is the only module that touches timezones.
 """
 
-from pathlib import Path
-
 import pandas as pd
 
-CACHE_DIR = Path(__file__).resolve().parent.parent / "data"
+from quant.cache import CACHE_DIR, cached
 
 HYNIX = "000660"   # KRX ticker, for pykrx
 KOSPI = "^KS11"    # yfinance symbol for the KOSPI index level
@@ -21,15 +19,6 @@ _COLS = {
     "종가": "close",
     "거래량": "volume",
 }
-
-
-def _cached(path, fetch):
-    if path.exists():
-        return pd.read_parquet(path)
-    df = fetch()
-    CACHE_DIR.mkdir(exist_ok=True)
-    df.to_parquet(path)
-    return df
 
 
 def _clean(df):
@@ -53,7 +42,7 @@ def load_prices(ticker=HYNIX, start="2019-01-01", end="2026-08-06"):
         )
         return _clean(raw)
 
-    return _cached(path, fetch)
+    return cached(path, fetch)
 
 
 def load_index(symbol=KOSPI, start="2019-01-01", end="2026-08-06"):
@@ -81,7 +70,7 @@ def load_index(symbol=KOSPI, start="2019-01-01", end="2026-08-06"):
         raw.index.name = "date"
         return raw[raw["close"] > 0].sort_index()
 
-    return _cached(path, fetch)
+    return cached(path, fetch)
 
 
 def trading_days(px):
