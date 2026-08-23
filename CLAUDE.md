@@ -39,13 +39,9 @@ related but distinct construct, stated here rather than quietly swapped.
 frequency* (daily pageview count for a topic) relate to SK Hynix price behavior? Sentiment,
 content, and author quality are explicitly out of scope for now.
 
-**Target**: SK Hynix — KRX ticker `000660.KS`. Note it trades on the Korea Exchange (KST, 09:00–15:30), while tweet volume is global and 24h. Aligning tweet windows to trading sessions is the core methodological problem of Phase 1.
-
-**Intended direction**:
-1. Collect daily tweet counts mentioning SK Hynix over some history.
-2. Collect matching daily OHLCV for `000660.KS`.
-3. Align the two into one daily panel, with tweet counts attributed to the correct trading day.
-4. Look at the relationship between tweet count (and its changes/abnormality vs. a rolling baseline) and next-period returns, volatility, and volume.
+**Target**: SK Hynix — KRX ticker `000660.KS`. It trades on the Korea Exchange
+(KST, 09:00–15:30) while attention data is global and 24h, so aligning attention windows
+to trading sessions is the core methodological problem of Phase 1.
 
 **Stack**: Python 3.13 in `.venv`. pandas / numpy / statsmodels / pykrx / yfinance /
 streamlit / altair. `pip install -r requirements.txt`.
@@ -53,9 +49,9 @@ streamlit / altair. `pip install -r requirements.txt`.
 ### Testing Framework
 
 A signal-agnostic harness for the general question "does signal X predict SK Hynix
-price behaviour?" — built before any real signal exists so the tweet-source decision
-stops gating progress. Tweet counts, Google Trends and anything else all reduce to
-one number per trading day, which is the only interface it requires.
+price behaviour?" — built before any real signal existed, so the unresolved data-source
+question could not gate progress. Pageviews, search volume, news volume and anything else
+all reduce to one number per trading day, which is the only interface it requires.
 
 | Module | Role |
 |---|---|
@@ -67,13 +63,23 @@ one number per trading day, which is the only interface it requires.
 | `quant/signals.py` | Signal registry + the three validation fixtures |
 | `quant/stats.py` | Rank IC, quantile buckets, Newey-West regressions, reverse causality |
 | `scripts/run_test.py` | CLI; writes a JSON record to `results/` |
-| `app.py` | Streamlit dashboard — a thin caller of the same functions, so it cannot drift |
+| `app.py` | Streamlit dashboard, two tabs — a thin caller of the same functions, so it cannot drift |
+
+**Dashboard tabs.** *Signal test* is the whole analysis and reproduces `run_test.py`
+exactly. *Price* is a plain view of `close` (log axis) and `volume` straight from the
+price panel — it computes nothing, which is why there is no module behind it. Anything
+derived that gets added there belongs in `quant/`, not in `app.py`.
 
 **Adding a real signal**: write a function `(px, kospi) -> Series` keyed by trading
-date, register it in `SIGNALS`, `SIGNAL_AGG` and `DEFAULT_TRANSFORM` (`"zscore"` for
-count-style signals). If it arrives as UTC timestamps, run it through
-`align.align_to_trading_days` first. `signals._pageview_signal` is the worked example.
-Nothing else changes — `app.py` and `run_test.py` populate their choices from `SIGNALS`.
+date and register it in `SIGNALS`, `SIGNAL_AGG` and `DEFAULT_TRANSFORM`. If it arrives as
+UTC timestamps, run it through `align.align_to_trading_days` first.
+`signals._pageview_signal` is the worked example. Nothing else changes — `app.py` and
+`run_test.py` populate their choices from `SIGNALS`.
+
+Pick `DEFAULT_TRANSFORM` by how the signal is bucketed: `"dow_zscore"` if it accumulates
+between market closes (Monday's bucket spans the weekend, so a mixed baseline reads it as
+abnormal every week), `"zscore"` for a count-style signal that does not, `"raw"` if it is
+already stationary. See `methodology.md`.
 
 **Real signals (Wikipedia pageviews, English):**
 
@@ -113,8 +119,9 @@ for a single specification. Consequences worth knowing before re-adding anything
   specification means one test. If multi-horizon ever returns, the correction has to
   return with it.
 - Dropping `fwd_vol`/`fwd_volrat` removes the targets where attention data most
-  plausibly shows an effect (volume and turbulence rather than direction). If tweet
-  counts read null on returns, this is the first thing to add back.
+  plausibly shows an effect — volume and turbulence rather than direction. All three
+  pageview signals have since read null on returns, so this is now the obvious next
+  thing to add back.
 - `ols_hac` still computes `coef` and `se_ols` internally; they are used by
   `long_short` and by the HAC-correction tests, just not displayed.
 
