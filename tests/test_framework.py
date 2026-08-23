@@ -15,7 +15,7 @@ import pytest
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from quant import align, cache, panel, signals, stats, wiki  # noqa: E402
+from quant import align, cache, panel, prices, signals, stats, wiki  # noqa: E402
 
 N_DAYS = 1200
 
@@ -309,7 +309,73 @@ def test_naive_index_passes_through():
     pd.testing.assert_series_equal(out, sig)
 
 
+# --- rebasing and comparison quotes (dashboard overlay) ---------------------
+
+
+def _series(values, start="2024-01-02"):
+    return pd.Series(values, dtype="float64",
+                     index=pd.bdate_range(start, periods=len(values), name="date"))
+
+
+def test_rebase_starts_at_100_and_preserves_ratios():
+    s = _series([250.0, 500.0, 125.0])
+    out = prices.rebase(s)
+    assert out.iloc[0] == 100.0
+    # The whole point: shape is untouched, only the level moves.
+    np.testing.assert_allclose(out / out.iloc[0], s / s.iloc[0])
+
+
+def test_rebase_anchors_on_the_first_observed_value():
+    """A US ticker reindexed onto the KRX calendar can start on a US holiday."""
+    s = _series([np.nan, np.nan, 400.0, 800.0])
+    out = prices.rebase(s)
+    assert np.isnan(out.iloc[0])
+    assert out.iloc[2] == 100.0
+    assert out.iloc[3] == 200.0
+
+
+def test_rebase_on_degenerate_input_is_nan_not_inf():
+    for bad in ([np.nan, np.nan], [0.0, 5.0]):
+        out = prices.rebase(_series(bad))
+        assert out.isna().all(), f"{bad} produced {out.tolist()}"
+
+
+def test_invalid_symbol_is_rejected_before_any_fetch_or_cache_write(monkeypatch):
+    def explode(*a, **k):
+        raise AssertionError("cache/network must not be reached")
+
+    monkeypatch.setattr(prices, "cached", explode)
+    for bad in ("../../etc/passwd", "", "A" * 16, "NV DA", "a;b"):
+        with pytest.raises(ValueError, match="invalid symbol"):
+            prices.load_quote(bad)
+
+
+def test_empty_download_raises_rather_than_caching_emptiness(monkeypatch, tmp_path):
+    """yfinance answers a bad-but-well-formed symbol with an empty frame."""
+    import types
+
+    monkeypatch.setattr(prices, "CACHE_DIR", tmp_path)
+    fake = types.SimpleNamespace(
+        download=lambda *a, **k: pd.DataFrame()
+    )
+    monkeypatch.setitem(sys.modules, "yfinance", fake)
+
+    with pytest.raises(ValueError, match="no data for"):
+        prices.load_quote("NOTATICKER")
+    assert not list(tmp_path.glob("*.parquet")), "an empty frame was cached"
+
+
 # --- price cross-check (network) -------------------------------------------
+
+
+@pytest.mark.slow
+def test_load_quote_returns_a_real_peer_series():
+    px = prices.load_prices(start="2024-01-01", end="2024-12-31")
+    peer = prices.load_quote("005930.KS", start="2024-01-01", end="2024-12-31")
+    assert not peer.empty
+    overlap = px.index.intersection(peer.index)
+    assert len(overlap) > 200, f"only {len(overlap)} overlapping days"
+    assert (peer["close"] > 0).all()
 
 
 @pytest.mark.slow

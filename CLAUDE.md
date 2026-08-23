@@ -56,7 +56,7 @@ all reduce to one number per trading day, which is the only interface it require
 | Module | Role |
 |---|---|
 | `quant/cache.py` | `CACHE_DIR` + `cached(path, fetch)` — the parquet cache, shared by every loader |
-| `quant/prices.py` | OHLCV for `000660` (pykrx) and KOSPI (`^KS11`, yfinance) |
+| `quant/prices.py` | OHLCV for `000660` (pykrx), KOSPI and any yfinance symbol; plus `rebase` |
 | `quant/wiki.py` | Wikipedia pageviews per UTC calendar day; the real signal source |
 | `quant/align.py` | UTC signal timestamps → KRX trading date. **The only module with timezone logic** |
 | `quant/panel.py` | Forward-return targets and signal transforms |
@@ -66,9 +66,18 @@ all reduce to one number per trading day, which is the only interface it require
 | `app.py` | Streamlit dashboard, two tabs — a thin caller of the same functions, so it cannot drift |
 
 **Dashboard tabs.** *Signal test* is the whole analysis and reproduces `run_test.py`
-exactly. *Price* is a plain view of `close` (log axis) and `volume` straight from the
-price panel — it computes nothing, which is why there is no module behind it. Anything
-derived that gets added there belongs in `quant/`, not in `app.py`.
+exactly. *Price* is a log-axis close chart with a SK Hynix volume panel, and takes any
+number of overlay tickers (`prices.load_quote`, any yfinance symbol, typed or picked).
+With an overlay present every line is `prices.rebase`d to 100 at the window start, so
+the axis reads as percentage growth and a KRW line is comparable to a USD one without
+FX; with none it shows raw KRW. Both live in `quant/prices.py` — `app.py` still
+computes nothing, and anything derived added later belongs in `quant/` too.
+
+**Overlay series are chart-only.** They are reindexed onto the KRX calendar and
+forward-filled, and a US close lands ~13.5h after the Korean close of the same date.
+That is fine for looking at, and disqualifying for a statistic — a peer series used as a
+signal or target must go through `quant/align.py` first, like every other cross-timezone
+series.
 
 **Adding a real signal**: write a function `(px, kospi) -> Series` keyed by trading
 date and register it in `SIGNALS`, `SIGNAL_AGG` and `DEFAULT_TRANSFORM`. If it arrives as

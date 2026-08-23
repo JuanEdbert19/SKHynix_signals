@@ -62,6 +62,23 @@ def get_prices(start, end):
     )
 
 
+@st.cache_data(show_spinner="Loading overlay…")
+def get_quote(symbol, start, end):
+    return prices.load_quote(symbol, start=start, end=end)["close"]
+
+
+PEERS = {
+    "005930.KS": "Samsung Electronics",
+    "NVDA": "Nvidia",
+    "MU": "Micron",
+    "TSM": "TSMC",
+    "ASML": "ASML",
+    "^KS11": "KOSPI",
+}
+# SK Hynix is pinned to SERIES so it stays identifiable whatever else is on.
+PALETTE = [SERIES, ACCENT, "#3d9970", "#8e5ea2", "#d1495b", "#7a7a76"]
+
+
 # --- controls ---------------------------------------------------------------
 
 st.sidebar.header("Specification")
@@ -253,28 +270,63 @@ with tab_price:
     st.caption(f"000660 · {px.index[0].date()} → {px.index[-1].date()} · "
                f"{len(px):,} trading days")
 
-    pr = px[["close", "volume"]].reset_index()
-    zoom = alt.selection_interval(bind="scales", encodings=["x"])
-    tips = [alt.Tooltip("date:T", title="Date"),
-            alt.Tooltip("close:Q", title="Close", format=",.0f"),
-            alt.Tooltip("volume:Q", title="Volume", format=",.0f")]
+    # No format_func: with accept_new_options=True Streamlit feeds the formatted
+    # label back as the value, so a typed "INTC" would arrive as "INTC (INTC)".
+    picked = st.multiselect(
+        "Overlay", options=list(PEERS), accept_new_options=True,
+        help="Pick a suggestion or type any yfinance symbol (e.g. INTC). "
+             + " · ".join(f"`{s}` {n}" for s, n in PEERS.items()),
+    )
 
-    line = alt.Chart(pr).mark_line(color=SERIES, strokeWidth=1.4).encode(
+    lines = {}
+    for sym in picked:
+        try:
+            peer = get_quote(sym, start, end)
+        except Exception as exc:
+            st.warning(f"Could not load `{sym}` — {exc}")
+            continue
+        # Onto the KRX calendar first, then filled, then rebased, so every line
+        # starts at 100 on the same date.
+        label = f"{PEERS[sym]} ({sym})" if sym in PEERS else sym
+        lines[label] = prices.rebase(peer.reindex(px.index).ffill())
+
+    # With no overlay there is nothing to compare against, so the raw KRW level is
+    # strictly more informative than an index. The axis title says which is shown.
+    rebased = bool(lines)
+    hynix = prices.rebase(px["close"]) if rebased else px["close"]
+    y_title = (f"Rebased to 100 at {px.index[0].date()}" if rebased
+               else "Close (KRW)")
+
+    lines = {"SK Hynix (000660)": hynix, **lines}
+    pr = pd.concat(
+        [s.rename("value").reset_index().assign(series=k) for k, s in lines.items()]
+    )
+    vol = px[["volume"]].reset_index()
+
+    zoom = alt.selection_interval(bind="scales", encodings=["x"])
+    line = alt.Chart(pr).mark_line(strokeWidth=1.4).encode(
         x=alt.X("date:T", title=None),
         # Log, not linear: the stock has multiplied several times over the sample,
         # so on a linear axis 2019 is a flat line and a 10% move then looks smaller
-        # than a 10% move in 2026.
-        y=alt.Y("close:Q", title="Close (KRW)",
+        # than a 10% move in 2026. Log also makes rebasing a pure vertical shift,
+        # so each line's shape survives it exactly.
+        y=alt.Y("value:Q", title=y_title,
                 scale=alt.Scale(type="log", nice=False, zero=False),
                 axis=alt.Axis(format=",.0f")),
-        tooltip=tips,
+        color=alt.Color("series:N", title=None,
+                        scale=alt.Scale(domain=list(lines), range=PALETTE),
+                        legend=alt.Legend(orient="top") if rebased else None),
+        tooltip=[alt.Tooltip("date:T", title="Date"),
+                 alt.Tooltip("series:N", title="Series"),
+                 alt.Tooltip("value:Q", title=y_title, format=",.1f")],
     ).properties(height=340, title="Close, log scale").add_params(zoom)
 
-    bars = alt.Chart(pr).mark_bar(color=SERIES, opacity=0.5).encode(
+    bars = alt.Chart(vol).mark_bar(color=SERIES, opacity=0.5).encode(
         x=alt.X("date:T", title=None),
         # Linear: the informative feature in volume is the spikes, which log flattens.
         y=alt.Y("volume:Q", title="Volume", axis=alt.Axis(format="~s")),
-        tooltip=tips,
+        tooltip=[alt.Tooltip("date:T", title="Date"),
+                 alt.Tooltip("volume:Q", title="Volume", format=",.0f")],
     ).properties(height=110)
 
     st.altair_chart(
@@ -285,9 +337,20 @@ with tab_price:
         ),
         width="stretch",
     )
-    st.caption(
+    caption = (
         "Close on a **log axis**, so equal percentage moves are equal vertical "
-        "distances. Unadjusted KRX close (pykrx) — **not** back-adjusted for "
-        "dividends or splits, so this is a price chart, not a total-return chart. "
-        "Volume in shares. Scroll or drag to zoom; both panels share the date axis."
+        "distances. Unadjusted close — **not** back-adjusted for dividends or "
+        "splits, so this is a price chart, not a total-return chart. "
+        "Scroll or drag to zoom; both panels share the date axis."
     )
+    if rebased:
+        caption += (
+            "\n\nEach line is divided by its own first value, so all start at 100 "
+            "and the axis reads as percentage growth — which is why no FX "
+            "conversion is needed to compare a KRW line with a USD one. Peers are "
+            "forward-filled onto the KRX calendar, and a US close lands ~13.5h "
+            "after the Korean close of the same date, so day-to-day alignment is "
+            "approximate. **Volume is SK Hynix only** — share counts are not "
+            "comparable across companies."
+        )
+    st.caption(caption)
