@@ -22,7 +22,7 @@
 This is a quantitative research project, so correctness of the *method* matters more than the code.
 
 - **No look-ahead bias**: a feature at time *t* may only use information available at time *t*. Be explicit about timestamp alignment and timezones.
-- **State assumptions in the analysis**, not just the code — sample period, universe, how missing data is handled.
+- **State assumptions in the analysis**, not just the code — to sample period, universe, how missing data is handled.
 - **Report negative results honestly.** "No significant relationship" is a valid and expected outcome. Never tune a spec until it produces a signal and then present that as a finding.
 - Any statistic reported must be reproducible by re-running a script in the repo.
 

@@ -67,16 +67,38 @@ def get_quote(symbol, start, end):
     return prices.load_quote(symbol, start=start, end=end)["close"]
 
 
+# Overlay shortcuts. yfinance symbols: a ".KS" suffix is a KOSPI-listed stock
+# (".KQ" for KOSDAQ) and the digits are the KRX code, while a "^" prefix is an
+# index rather than a security. Add rows here and they appear in the dashboard.
 PEERS = {
-    "005930.KS": "Samsung Electronics",
-    "NVDA": "Nvidia",
-    "MU": "Micron",
-    "TSM": "TSMC",
-    "ASML": "ASML",
-    "^KS11": "KOSPI",
+    "005930.KS": "Samsung Electronics — KRX memory rival",
+    "NVDA": "Nvidia — largest HBM customer",
+    "MU": "Micron — the third HBM supplier",
+    "TSM": "TSMC — foundry, packages HBM stacks",
+    "ASML": "ASML — lithography, upstream of everyone",
+    # Upstream suppliers. SK Siltron (wafers) and NAMICS (underfill) belong here
+    # on the supply chain but are privately held, so there is nothing to plot.
+    "4063.T": "Shin-Etsu Chemical — silicon wafers, Tokyo listed",
+    "LIN": "Linde — process gases for fab and etch",
+    "357780.KQ": "Soulbrain — process chemicals; listed 2020-08",
+    "102710.KQ": "ENF Technology — high-purity process chemicals",
+    "^KS11": "KOSPI index — the Korean market itself",
 }
+# The name is carried inside the option string rather than through format_func,
+# which corrupts free-text entries under accept_new_options. Both a picked
+# option and a typed symbol are read back the same way: take the first word.
+PEER_OPTIONS = [f"{sym}  ·  {name}" for sym, name in PEERS.items()]
+# Legend wants the company, not the "why it's here" half.
+PEER_NAME = {sym: name.split(" — ")[0] for sym, name in PEERS.items()}
+
 # SK Hynix is pinned to SERIES so it stays identifiable whatever else is on.
-PALETTE = [SERIES, ACCENT, "#3d9970", "#8e5ea2", "#d1495b", "#7a7a76"]
+PALETTE = [SERIES, ACCENT, "#3d9970", "#8e5ea2", "#d1495b", "#7a7a76",
+           "#2e8b8b", "#b5651d", "#6a5acd", "#4f772d", "#c9184a", "#1b6ca8"]
+
+# A foreign exchange's first session of the year can fall a few days after the
+# KRX's, which is a calendar difference, not a different starting point. Only a
+# gap wider than this means the ticker genuinely was not listed yet.
+LATE_START_DAYS = 15
 
 
 # --- controls ---------------------------------------------------------------
@@ -273,21 +295,22 @@ with tab_price:
     # No format_func: with accept_new_options=True Streamlit feeds the formatted
     # label back as the value, so a typed "INTC" would arrive as "INTC (INTC)".
     picked = st.multiselect(
-        "Overlay", options=list(PEERS), accept_new_options=True,
-        help="Pick a suggestion or type any yfinance symbol (e.g. INTC). "
-             + " · ".join(f"`{s}` {n}" for s, n in PEERS.items()),
+        "Overlay tickers", options=PEER_OPTIONS, accept_new_options=True,
+        placeholder="Type any yfinance ticker (e.g. INTC, 000155.KS) or pick below",
+        help="This box accepts free text — type a symbol and press Enter to add it. "
+             "The listed companies are only shortcuts.",
     )
 
     lines = {}
-    for sym in picked:
+    for choice in picked:
+        sym = choice.split()[0] if choice.split() else ""
         try:
             peer = get_quote(sym, start, end)
         except Exception as exc:
             st.warning(f"Could not load `{sym}` — {exc}")
             continue
-        # Onto the KRX calendar first, then filled, then rebased, so every line
-        # starts at 100 on the same date.
-        label = f"{PEERS[sym]} ({sym})" if sym in PEERS else sym
+        # Onto the KRX calendar first, then filled, then rebased.
+        label = f"{PEER_NAME[sym]} ({sym})" if sym in PEER_NAME else sym
         lines[label] = prices.rebase(peer.reindex(px.index).ffill())
 
     # With no overlay there is nothing to compare against, so the raw KRW level is
@@ -298,6 +321,21 @@ with tab_price:
                else "Close (KRW)")
 
     lines = {"SK Hynix (000660)": hynix, **lines}
+
+    # A ticker listed after the window opens is rebased to its own first day, not
+    # to the window start, so its 100 sits at a different date from everyone
+    # else's. Silently plotted, that reads as a common starting point.
+    late = {k: s.first_valid_index() for k, s in lines.items()}
+    late = {k: d for k, d in late.items()
+            if d is not None and (d - px.index[0]).days > LATE_START_DAYS}
+    if late:
+        st.info(
+            "Not all lines share a starting point — these begin at 100 on a later "
+            "date, so their level is growth since **their** first day, not since "
+            + f"{px.index[0].date()}: "
+            + " · ".join(f"**{k}** {d.date()}" for k, d in late.items()),
+            icon="ℹ️",
+        )
     pr = pd.concat(
         [s.rename("value").reset_index().assign(series=k) for k, s in lines.items()]
     )
@@ -314,7 +352,11 @@ with tab_price:
                 scale=alt.Scale(type="log", nice=False, zero=False),
                 axis=alt.Axis(format=",.0f")),
         color=alt.Color("series:N", title=None,
-                        scale=alt.Scale(domain=list(lines), range=PALETTE),
+                        # Cycled, so more overlays than colours repeats a colour
+                        # rather than leaving a line unstyled.
+                        scale=alt.Scale(domain=list(lines),
+                                        range=[PALETTE[i % len(PALETTE)]
+                                               for i in range(len(lines))]),
                         legend=alt.Legend(orient="top") if rebased else None),
         tooltip=[alt.Tooltip("date:T", title="Date"),
                  alt.Tooltip("series:N", title="Series"),
