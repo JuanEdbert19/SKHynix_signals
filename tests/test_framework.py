@@ -15,7 +15,7 @@ import pytest
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from quant import align, cache, panel, prices, signals, stats, wiki  # noqa: E402
+from quant import align, cache, naver, panel, prices, signals, stats, wiki  # noqa: E402
 
 N_DAYS = 1200
 
@@ -155,6 +155,22 @@ def test_hac_correction_is_small_for_serially_uncorrelated_signal():
 
     res = stats.ols_hac(pnl["fwd_ret_3"], sig, maxlags=3)
     assert 0.9 < res["se"] / res["se_ols"] < 1.1
+
+
+def test_evaluate_reports_significance_and_sample_for_the_long_short():
+    """The spread's p and its own n must survive `evaluate`.
+
+    Both were computed by long_short and dropped, leaving a t-statistic with no
+    significance beside it and the full-sample n, which reads as though the
+    spread were measured on every day rather than the extreme buckets.
+    """
+    res = stats.evaluate(build("planted", seed=0), horizon=3, q=5)
+    for k in ("ls_p", "ls_n"):
+        assert k in res, f"evaluate dropped {k}"
+    assert 0.0 <= res["ls_p"] <= 1.0
+    # Two of five buckets, so roughly 40% of the regression sample.
+    assert res["ls_n"] < res["n"], "long-short must use fewer days than the full fit"
+    assert 0.3 < res["ls_n"] / res["n"] < 0.5, res["ls_n"] / res["n"]
 
 
 def test_evaluate_regresses_return_on_signal_not_the_reverse(monkeypatch):
@@ -609,3 +625,140 @@ def test_wiki_signals_use_mean_and_dow_zscore():
     for name in ("wiki_hynix", "wiki_semi", "wiki_hbm"):
         assert signals.SIGNAL_AGG[name] == "mean"
         assert signals.DEFAULT_TRANSFORM[name] == "dow_zscore"
+
+
+# --- Naver search trends: KST day -> trading day -----------------------------
+
+NAVER_SIGNALS = ("naver_hynix", "naver_semi", "naver_hbm", "naver_memory",
+                 "naver_samsung")
+
+
+def _nv(dates, values):
+    """A daily search-trend series keyed by KST calendar date."""
+    return pd.Series(values, index=pd.DatetimeIndex(dates), dtype="float64",
+                     name="nv")
+
+
+def test_daily_kst_stamped_at_the_close_of_its_own_day():
+    """A KST day's total is stamped 00:00 KST of the NEXT day.
+
+    That instant is 15:00 UTC on the day itself - 8.5h after the 06:30 UTC KRX
+    close, so the value cannot reach the session it would otherwise predict.
+    """
+    out = align.daily_kst_to_timestamps(_nv(["2024-01-10"], [7.0]))
+    assert out.index[0] == pd.Timestamp("2024-01-11 00:00", tz=align.KST)
+    assert out.index[0].tz_convert("UTC") == pd.Timestamp("2024-01-10 15:00", tz="UTC")
+    assert out.iloc[0] == 7.0
+
+
+def test_naver_day_lands_on_the_next_trading_day_not_the_same_one():
+    """The look-ahead guard, matching the pageview one.
+
+    A Naver day covers 00:00-24:00 KST while the market closes at 15:30 KST, so
+    attributing day D to session D would use 8.5h of post-close searching to
+    predict that session's own forward return.
+    """
+    days = _trading_days()
+    out = align.align_to_trading_days(
+        align.daily_kst_to_timestamps(_nv(["2024-01-08"], [50.0])), days, agg="mean")
+    assert pd.isna(out.loc["2024-01-08"]), "KST day D leaked into session D"
+    assert out.loc["2024-01-09"] == 50.0
+
+
+def test_naver_weekend_days_accumulate_into_monday():
+    """Monday's bucket spans Fri+Sat+Sun; with agg='mean' it is their average.
+
+    This is what depresses Monday - weekend search runs at ~12% of weekday
+    search - and it is why dow_zscore is mandatory for these signals.
+    """
+    days = _trading_days()
+    out = align.align_to_trading_days(
+        align.daily_kst_to_timestamps(
+            _nv(["2024-01-05", "2024-01-06", "2024-01-07"], [9.0, 1.0, 2.0])),
+        days, agg="mean")
+    assert out.loc["2024-01-08"] == pytest.approx(4.0)
+
+
+def test_naver_signals_are_registered_with_mean_and_dow_zscore():
+    """dow_zscore is not a preference here: under plain zscore, Monday's share
+    of the top quintile measures 0.0% on the real series."""
+    for name in NAVER_SIGNALS:
+        assert name in signals.SIGNALS
+        assert signals.SIGNAL_AGG[name] == "mean"
+        assert signals.DEFAULT_TRANSFORM[name] == "dow_zscore"
+
+
+def _workbook(path, period="일간 : 2019-01-01 ~ 2019-01-03", scope="합계",
+              gender="전체(여성,남성)", ages="전체"):
+    import openpyxl
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = naver.SHEET
+    for row in [("url", "http://datalab.naver.com/keyword/trendResult.naver?hashKey=X"),
+                ("주제", "통검"), ("범위", scope), ("기간", period),
+                ("성별", gender), ("연령대", ages), ("날짜", "topic"),
+                ("2019-01-01", "1.5"), ("2019-01-02", "2.5"), ("2019-01-03", "3.5")]:
+        ws.append(row)
+    wb.save(path)
+    return path
+
+
+def test_loader_reads_a_kst_keyed_series(tmp_path, monkeypatch):
+    monkeypatch.setattr(naver, "CACHE_DIR", tmp_path)
+    monkeypatch.setitem(naver.FILES, "hynix", "wb.xlsx")
+    _workbook(tmp_path / "wb.xlsx")
+
+    s = naver.load_trend("hynix")
+    assert list(s.index) == list(pd.DatetimeIndex(
+        ["2019-01-01", "2019-01-02", "2019-01-03"]))
+    assert s.tolist() == [1.5, 2.5, 3.5]
+    assert s.index.tz is None, "calendar dates, not timestamps - align.py converts"
+
+
+@pytest.mark.parametrize("bad,field", [
+    ({"period": "주간 : 2019-01-01 ~ 2019-01-03"}, "기간"),
+    ({"scope": "모바일"}, "범위"),
+    ({"gender": "남성"}, "성별"),
+    ({"ages": "20-29"}, "연령대"),
+])
+def test_loader_rejects_a_wrongly_exported_workbook(tmp_path, monkeypatch, bad, field):
+    """The settings are hand-set toggles in a web UI.
+
+    A weekly or device-filtered export loads, aligns and regresses without
+    complaint, producing a result for a different question than the one asked.
+    Nothing downstream would reveal it, so it is caught at the door.
+    """
+    monkeypatch.setattr(naver, "CACHE_DIR", tmp_path)
+    monkeypatch.setitem(naver.FILES, "hynix", "wb.xlsx")
+    _workbook(tmp_path / "wb.xlsx", **bad)
+
+    with pytest.raises(ValueError, match=field):
+        naver.load_trend("hynix")
+
+
+def test_loader_names_the_recovery_path_when_a_workbook_is_missing(tmp_path, monkeypatch):
+    """The files are gitignored and the API is closed, so a clone hits this."""
+    monkeypatch.setattr(naver, "CACHE_DIR", tmp_path)
+    with pytest.raises(FileNotFoundError, match="data-sources.md"):
+        naver.load_trend("hynix")
+
+
+@pytest.mark.slow
+def test_naver_dow_artifact_is_real_and_dow_zscore_fixes_it():
+    """Pins the measurement that decided the transform. Needs data/.
+
+    Under plain zscore Monday never reaches the top quintile at all, because its
+    bucket averages Fri+Sat+Sun and weekend search is ~12% of weekday search.
+    """
+    from quant import prices
+
+    px = prices.load_prices()
+    sig = signals.load_signal("naver_hynix", px)
+
+    def monday_share(kind):
+        z = panel.transform(sig, kind=kind, window=20).dropna()
+        return (z[z >= z.quantile(0.8)].index.dayofweek == 0).mean()
+
+    assert monday_share("zscore") < 0.05, "expected Monday to be locked out"
+    assert 0.15 < monday_share("dow_zscore") < 0.25

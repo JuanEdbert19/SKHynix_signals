@@ -2,16 +2,19 @@
 
 Options for obtaining **daily tweet counts mentioning SK Hynix**. Nothing else.
 
-Status: **no tweet source is currently obtainable.** As of 2026-08-20 every option is
-blocked, priced out, or disqualified — see the ranking at the end. This is a change from
-the previous review, which treated Option B as a free working default.
+Status: **no tweet source is obtainable, and there is no open action that would change
+that.** Every option is blocked, priced out, or disqualified — see the ranking at the end.
+The last remaining cheap test, whether an archive.org account unlocks Option B, was run on
+2026-08-24 and failed. This is a change from the review before 2026-08-20, which treated
+Option B as a free working default.
 
 Sentiment-vendor products (MarketPsych, RavenPack, Bloomberg, Brandwatch, Sometrend) are
 deliberately excluded — they are sentiment/media-analytics products, not tweet-count
 sources.
 
-Last reviewed: 2026-08-20 (Option B re-verified against the live Internet Archive API;
-findings below are reproducible with the commands given in each section).
+Last reviewed: 2026-08-24 (Option B access tested with a real archive.org account — see
+Blocker 1). Earlier findings verified 2026-08-20 against the live Internet Archive API;
+all are reproducible with the commands given in each section.
 
 ---
 
@@ -87,9 +90,11 @@ what was *posted*. See deletion decay below.
 
 ## Option B — Internet Archive Twitter sample stream (1% Spritzer)
 
-> **BLOCKED as of 2026-08-20.** The collection is no longer anonymously downloadable.
-> Everything below the mechanism description is retained because the analysis is still
-> correct *if* access is ever restored — but it cannot currently be executed.
+> **BLOCKED as of 2026-08-20; confirmed unrecoverable 2026-08-24.** The collection requires
+> a privilege grant that an ordinary archive.org account does not carry — tested with valid
+> credentials and with a logged-in browser session, both 401. Everything below the mechanism
+> description is retained because the analysis is still correct *if* access is ever granted,
+> but there is no action available that obtains it.
 
 **Mechanism.** Not a search. Twitter's `statuses/sample` endpoint pushed ~1% of all public
 tweets worldwide in real time. Archive Team held that connection open for years and wrote
@@ -147,11 +152,31 @@ available for download via torrent last year but they're no longer available" (2
 The Archive Team wiki now describes the collection as "rather useless now that IA restricted
 the access, since it's not WARCs."
 
-**Whether a free archive.org account lifts the 401 is UNVERIFIED.** `access-restricted-item`
-is normally a login gate rather than a dark flag (`is_dark` is not set), so a plain account
-may suffice — but this was not testable here and should not be assumed. Torrents are not a
-workaround: they 401 as well, and reported live swarms exist for only four months
-(2022-03, 2022-04, 2022-05, 2023-01).
+**A free archive.org account does NOT lift the 401. Verified 2026-08-24 — this was
+previously the single highest-value open question in this document, and it resolves
+against Option B.**
+
+An account was created and tested three ways:
+
+| Test | Result |
+|---|---|
+| `archive.org/services/user.php?op=whoami` with IA-S3 keys | **200** — credentials valid, account `@juanedbert`, `"privs": []` |
+| `s3.us.archive.org/?check_limit=1` with the same keys | **200** — the S3 API accepts them |
+| Unrestricted control item, anonymous and authenticated | **200 / 200** |
+| `twitter_stream_2019_06_01.tar`, anonymous and authenticated | **401 / 401** |
+| Same URL in a **logged-in browser** (real session cookie) | **401** |
+
+The browser test is the one that closes it. IA-S3 keys authenticate the S3/metadata API and
+might not be honoured by the download gate, so the header test alone was not conclusive; a
+logged-in browser carries the `logged-in-user` / `logged-in-sig` session cookies that the
+gate would honour if it were login-based. It still 401s.
+
+So `access-restricted-item` here is a **privilege grant, not a login gate** — consistent
+with the empty `privs` array on a normal account. `is_dark` is not set, but that turns out
+not to imply anonymous-or-account access.
+
+Torrents are not a workaround: they 401 as well, and reported live swarms exist for only
+four months (2022-03, 2022-04, 2022-05, 2023-01).
 
 ### BLOCKER 2 — the archive stops at 2023-01-30
 
@@ -437,11 +462,11 @@ redistributing **tweet IDs only**, not tweet content.
 | | Raw tweet count? | Mechanism | Variance | Bias | Auditable | Cost | Obtainable now? |
 |---|---|---|---|---|---|---|---|
 | **A. Official API** | **Yes — exact integer** | Server-side count over live index | Low | Downward, age-dependent, lumpy | Partly | ~$42k/mo | Priced out |
-| **B. IA Spritzer** | No — 1% sample, scaled ×~105 | You count raw tweets yourself | **High** (Poisson) | **~None** | **Fully** | Free* | **No — 401** |
+| **B. IA Spritzer** | No — 1% sample, scaled ×~105 | You count raw tweets yourself | **High** (Poisson) | **~None** | **Fully** | n/a* | **No — 401, account tested** |
 | **C. Resellers** | Nominally, but untrustworthy | Query their scrape | Unknown | **Censors peaks** | No | Low | Yes, but disqualified |
 | **D. ID datasets** | No — needs rehydration | Someone else's ID list | n/a | n/a | Partly | Free | Gated behind A |
 
-\* free only if an archive.org account clears `access-restricted-item`, which is unverified.
+\* was free; price is now moot, since no account tier available to us can download it.
 
 **Ranking rationale.** For a research finding, **bias is more dangerous than variance.**
 Noise costs statistical power and is visible in advance. Bias produces a confident,
@@ -453,9 +478,11 @@ resolved in the worst direction: **B is no longer obtainable either.**
 
 **Practical ordering as of 2026-08-20:**
 
-1. **B** — still the best design if access is restored. Blocked on an account test that
-   costs minutes. Even if unblocked, it carries ~3.6 TB, 125 missing days across four
-   multi-week blocks, five container formats, and a hard 2023-01 cutoff.
+1. **B** — still the best *design*, and now unobtainable in practice. The account test that
+   was the cheapest open action has been run and failed (2026-08-24). Nothing short of a
+   privilege grant from the Internet Archive changes this, so it is no longer a next step —
+   it is a closed option. Even if it reopened, it carries ~3.6 TB, 125 missing days across
+   four multi-week blocks, five container formats, and a hard 2023-01 cutoff.
 2. **A** — best raw measurement, priced out, and needs a control series to be trusted.
    The deletion bias is now quantified at ~18.5% over four years (Sequiera & Lin 2017).
 3. **D** — cheap to check, unlikely to yield anything, and rehydration needs A.
@@ -599,11 +626,89 @@ retry config stripped to run at all.
 | **Bluesky** public AppView | **403** from this host; and no history before 2023 regardless |
 | **Hacker News** (Algolia) | **200 — works**, but `"SK Hynix"` returns **137 stories total since 2019** (~1.6/month). Free and reliable, useless at daily resolution |
 
+### Naver DataLab — API closed, web export open (tested 2026-08-24)
+
+Naver is ~60% of Korean search, so it matches the audience that actually trades this stock
+far better than Wikipedia does — a Wikipedia lookup is encyclopedic curiosity, and
+`ko:SK하이닉스` averages only 75 views/day (median 62), which is mostly integer
+quantization. DataLab is therefore the best-matched attention source identified here.
+
+**The REST API is not available to accounts registered now.** A real Naver developer app
+was created and tested:
+
+| Step | Result |
+|---|---|
+| `POST openapi.naver.com/v1/datalab/search`, invalid keys | `NID AUTH Result Invalid (1000)` — key not recognised |
+| Same call with the **new app's real keys** | **`Scope Status Invalid`** — keys valid, app lacks the DataLab scope |
+| Selecting 데이터랩(검색어트렌드) at app registration | Not offered in the picker |
+| Selecting it in an existing app's API settings | **"An API that cannot be newly registered has been selected"** |
+| Selecting 검색 (Search) | Same refusal |
+
+The distinct error messages are what make this conclusive: authentication succeeds and only
+the *scope* is refused, so the credentials are not the problem — the app cannot be granted
+DataLab at all. Both of Naver's data APIs are closed to new registrations while remaining
+visible in the UI.
+
+**The web interface is unaffected:** `datalab.naver.com/keyword/trendSearch.naver` returns
+200 and requires no app, scope or key. It serves the same underlying series as a file
+export rather than JSON. Since this project needs one download and not a live feed, that
+costs little — a committed CSV plus a loader keeps every reported statistic reproducible,
+though acquisition is then manual and must be documented as such.
+
+DataLab scales every keyword group against the single maximum across the whole query, so a
+high-volume control in the same request would compress SK Hynix toward zero. **Each topic
+is therefore pulled as its own query**, accepting that levels are not comparable between
+files — which costs nothing, since every signal is z-scored independently.
+
+#### The five exports (adopted 2026-08-24)
+
+Daily granularity across the full span was confirmed available: **2,775 days,
+2019-01-01 → 2026-08-06, zero missing**, five decimal places, 2,741 distinct values, no
+zeros. The web export is not capped the way Google Trends is.
+
+Settings, identical for all five: **기간** 직접입력 `2019-01-01`~`2026-08-06` · **일간**
+(daily) · **범위** 전체 · **성별** 전체 · **연령** unchecked. `quant/naver.py` re-checks
+the last three on load and refuses a file that disagrees.
+
+| File (in gitignored `data/`) | Keywords as specified | Query permalink |
+|---|---|---|
+| `hynix_datalab.xlsx` | `SK하이닉스,하이닉스,에스케이하이닉스,SK hynix,000660,SK하이닉스 주가,하이닉스 주가` | [`N_3b29bff4…`](http://datalab.naver.com/keyword/trendResult.naver?hashKey=N_3b29bff48b07fcf25fee95d9f28275ae) |
+| `semi_datalab.xlsx` | `반도체,반도체주,반도체 관련주,반도체 전망,시스템반도체,메모리 반도체,파운드리` | [`N_c54c9143…`](http://datalab.naver.com/keyword/trendResult.naver?hashKey=N_c54c91435d1b29ad2b549c20a000c394) |
+| `hbm_datalab.xlsx` | `HBM,에이치비엠,고대역폭메모리,HBM3,HBM3E,HBM4,HBM 관련주` | [`N_1273e9c1…`](http://datalab.naver.com/keyword/trendResult.naver?hashKey=N_1273e9c17cf031ceca52fcc0e9256c54) |
+| `memory_datalab.xlsx` | `D램,디램,DRAM,낸드,낸드플래시,NAND,메모리 가격,디램 가격` | [`N_033866b2…`](http://datalab.naver.com/keyword/trendResult.naver?hashKey=N_033866b24fb230a0bb93d991dabdea3d) |
+| `samsung_datalab.xlsx` | `삼성전자,005930,삼성전자 주가` | [`N_797c5025…`](http://datalab.naver.com/keyword/trendResult.naver?hashKey=N_797c502510094d2fd47e01cbb39577a1) |
+
+**The permalinks are the authoritative record, not the keyword column.** The .xlsx stores
+the topic label and the settings but not the keyword list, so the column above is what was
+specified rather than what is provably in the file; each permalink resolves (HTTP 200) and
+shows the query as run. Any discrepancy should be resolved in favour of the permalink.
+
+**The .xlsx files are deliberately not committed** (developer's call, 2026-08-24) — `data/` is
+gitignored. Since the API is closed, this table plus the permalinks is the only thing that
+makes them regenerable, which is why the settings are spelled out. A clone cannot reproduce
+any Naver statistic without re-running these five exports by hand.
+
+#### Behaviour worth knowing before using them
+
+- **Weekend search is 12.4% of weekday search** — far more extreme than Wikipedia's. Under
+  `agg="mean"` Monday's Fri+Sat+Sun bucket averages 2.76 against ~6.5–7.0 for other
+  weekdays, and under plain `zscore` **Monday's share of the top quintile measures 0.0%** —
+  it can never register as high attention. `dow_zscore` returns it to 21.2%. See
+  `methodology.md`.
+- **`naver_hynix` and `naver_samsung` correlate 0.86** on a same-weekday baseline (0.93 on
+  weekday-only log changes), against 0.42 for the Wikipedia equivalents. The control is
+  nearly collinear with the primary, so ~90% of SK Hynix search attention is shared with
+  Samsung and *company-specific* attention is a thin residue.
+- **`naver_semi` is anchored by one day** — 2019-05-01 at 100.0 against 58.8 for the next
+  highest.
+- **`naver_hbm`'s keyword composition changes over the sample** — `HBM3`/`HBM3E`/`HBM4` have
+  no volume before each generation existed.
+
 ### Free but require registration
 
 | Source | Probe result | Note |
 |---|---|---|
-| **Naver DataLab** | `401 Not Exist Client ID` — endpoint live | Highest-value untested source here: Naver is ~60% of Korean search, so it matches the audience that actually trades this stock. Same 0–100 index limitation as Google Trends |
+| **Naver DataLab** | **API closed to new apps (2026-08-24)** — see below | Web export still open |
 | **DART** | `status 010, unregistered key` — endpoint live | Event timestamps, not attention |
 
 ### The axis that matters
@@ -648,17 +753,21 @@ Google Trends requires `pytrends` with its retry config removed; see the note ab
 - **GDELT Korean-language coverage.** The `SK하이닉스` query was not successfully run. This
   matters: if GDELT under-covers Korean media, the series measures Anglophone coverage of a
   Korean company, which is a materially weaker proxy.
-- **Naver DataLab** beyond endpoint liveness — no key was obtained.
+- ~~**Naver DataLab** beyond endpoint liveness — no key was obtained.~~ **Resolved
+  2026-08-24: the API is closed to new applications** (keys authenticate, scope is refused).
+  Still unverified: whether the *web* export allows daily granularity over the full span.
 - Whether the Bluesky and StockTwits 403s are permanent policy or host-specific blocking.
 
 ---
 
 ## Open decisions
 
-1. Tweet source — A–D above. **Now blocked on access, not on the base rate.** The cheapest
-   next step is testing whether a free archive.org account lifts the 401 on Option B.
-2. Whether to substitute an attention proxy for tweets at all, given no free tweet source
-   exists. This is a change to the project's research question, not a data-source choice.
+1. ~~Tweet source — A–D above.~~ **Closed 2026-08-24.** Every option is blocked, priced out
+   or disqualified, and the last cheap test (an archive.org account on Option B) has now
+   been run and failed. There is no open action that yields tweet counts.
+2. Whether to substitute an attention proxy for tweets at all. **Effectively decided by
+   (1)** — Wikimedia pageviews were adopted 2026-08-20. This is a change to the project's
+   research question, not a data-source choice, and is stated as such in CLAUDE.md.
 3. Query definition, if tweets ever become available: English vs. Korean vs. cashtag;
    include or exclude retweets.
 4. Sample period, driven by whichever source is chosen.
@@ -666,9 +775,10 @@ Google Trends requires `pytrends` with its retry config removed; see the note ab
 ## Known unverified claims in this document
 
 Flagged so they are not mistaken for established fact:
-- **Whether a free archive.org account lifts `access-restricted-item` on Option B.** Only
-  anonymous failure was verified. This is the single highest-value open question here.
-- SK Hynix tweet base rate — still unmeasured, and now unmeasurable without access.
+- ~~Whether a free archive.org account lifts `access-restricted-item` on Option B.~~
+  **Resolved 2026-08-24: it does not.** See the table in Blocker 1.
+- SK Hynix tweet base rate — still unmeasured, and now permanently unmeasurable by this
+  route.
 - Contents of `twitter-stream-20221212.tar.gz` (47.5 GB) and the oversized
   `twitter-stream-20230130.tar` (11.7 GB); both are inferred from size anomalies.
 - Which inner compression (`.bz2` vs `.gz`) applies to which era — third-party evidence
@@ -678,6 +788,12 @@ Flagged so they are not mistaken for established fact:
 - Korean-language coverage depth for every option.
 
 ### Provenance note
+
+The 2026-08-24 access test used a real archive.org account created for the purpose.
+Credentials came from `archive.org/account/s3.php`, were kept in a git-ignored `.env`, and
+were used only against `archive.org` — validity confirmed via `services/user.php?op=whoami`
+and `s3.us.archive.org/?check_limit=1` before the download probes, so a 401 cannot be
+attributed to a bad key. The browser check was performed by the developer.
 
 Findings marked as verified on 2026-08-20 were obtained directly from
 `archive.org/metadata/`, `archive.org/advancedsearch.php`, and HTTP status codes on

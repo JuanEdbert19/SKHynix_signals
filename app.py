@@ -165,7 +165,11 @@ with tab_signal:
     c[2].metric("p (HAC)", f"{res['p_hac']:.4f}",
                 delta="significant" if res["p_hac"] < stats.ALPHA else "not significant",
                 delta_color="normal" if res["p_hac"] < stats.ALPHA else "off")
-    c[3].metric("Top−bottom spread", f"{res['ls_spread']:+.4f}", help=f"HAC t = {res['ls_t']:+.2f}")
+    c[3].metric("Top−bottom spread", f"{res['ls_spread']:+.4f}",
+                help=f"Extreme buckets only — HAC t = {res['ls_t']:+.2f}, "
+                     f"p = {res['ls_p']:.4f}, n = {int(res['ls_n']):,}. "
+                     f"This is a different sample from the {int(res['n']):,} "
+                     "observations shown at right.")
     c[4].metric("Observations", f"{int(res['n']):,}")
 
     if res["p_hac"] >= stats.ALPHA:

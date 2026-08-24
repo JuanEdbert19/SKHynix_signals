@@ -12,7 +12,7 @@ distinguished from a broken pipeline.
 import numpy as np
 import pandas as pd
 
-from quant import align, wiki
+from quant import align, naver, wiki
 
 PLANTED_RHO = 0.15
 PLANTED_HORIZON = 3
@@ -89,6 +89,71 @@ def wiki_hbm(px, kospi=None):
     return _pageview_signal(px, "hbm", "wiki_hbm")
 
 
+def _naver_signal(px, key, name):
+    """One Naver search-trend series, mapped onto KRX trading days.
+
+    Same shape as _pageview_signal, but the source is keyed by KST calendar date
+    rather than UTC, so it goes through the KST stamping function.
+    """
+    raw = naver.load_trend(key)
+    stamped = align.daily_kst_to_timestamps(raw)
+    return align.align_to_trading_days(
+        stamped, px.index, agg=SIGNAL_AGG[name]
+    ).rename(name)
+
+
+def naver_hynix(px, kospi=None):
+    """Naver searches for SK Hynix. The primary real signal.
+
+    Keyword group includes `주가` variants and the ticker 000660, so this is
+    investor lookup rather than general curiosity — the construct wiki_hynix
+    was reaching for and missing.
+    """
+    return _naver_signal(px, "hynix", "naver_hynix")
+
+
+def naver_semi(px, kospi=None):
+    """Naver searches for 반도체 and related. Secondary — industry attention.
+
+    One day dominates its scale: 2019-05-01 sits at 100.0 against 58.8 for the
+    next highest.
+    """
+    return _naver_signal(px, "semi", "naver_semi")
+
+
+def naver_hbm(px, kospi=None):
+    """Naver searches for HBM. Secondary — product-story attention.
+
+    Keyword composition shifts over the sample: HBM3/HBM3E/HBM4 have no volume
+    before each generation existed, so expect a transient around each launch
+    until the rolling baseline catches up.
+    """
+    return _naver_signal(px, "hbm", "naver_hbm")
+
+
+def naver_memory(px, kospi=None):
+    """Naver searches for DRAM/NAND. Secondary — the earnings driver.
+
+    Memory pricing is what actually moves SK Hynix earnings, so this is the
+    most fundamentally motivated of the industry terms and has no Wikipedia
+    counterpart.
+    """
+    return _naver_signal(px, "memory", "naver_memory")
+
+
+def naver_samsung(px, kospi=None):
+    """Naver searches for Samsung Electronics. CONTROL — never a finding.
+
+    Registered so it is inspectable, not so it can be tested. Sector-wide
+    Korean attention hits both stocks; company-specific attention does not.
+
+    Note it correlates 0.86 with naver_hynix on a same-weekday baseline (0.93 on
+    weekday-only log changes) against 0.42 for the Wikipedia equivalents, so it
+    is nearly collinear with the primary and differencing leaves a thin residual.
+    """
+    return _naver_signal(px, "samsung", "naver_samsung")
+
+
 SIGNALS = {
     "noise": noise,
     "planted": planted,
@@ -96,6 +161,11 @@ SIGNALS = {
     "wiki_hynix": wiki_hynix,
     "wiki_semi": wiki_semi,
     "wiki_hbm": wiki_hbm,
+    "naver_hynix": naver_hynix,
+    "naver_semi": naver_semi,
+    "naver_hbm": naver_hbm,
+    "naver_memory": naver_memory,
+    "naver_samsung": naver_samsung,
 }
 
 # Counts are aggregated by sum when aligned; level-like signals by mean.
@@ -105,16 +175,30 @@ SIGNALS = {
 # rather than of attention. Mean gives average daily attention since the last
 # close, which is comparable across weekdays. Paired with the dow_zscore
 # transform below - neither fixes the artifact alone.
+#
+# The Naver signals use "mean" for the same reason, and need it more: weekend
+# search runs at 12.4% of weekday search, so Monday's Fri+Sat+Sun bucket is
+# depressed rather than inflated - the mirror of the pageview artifact.
 SIGNAL_AGG = {"noise": "mean", "planted": "mean", "past_return": "mean",
-              "wiki_hynix": "mean", "wiki_semi": "mean", "wiki_hbm": "mean"}
+              "wiki_hynix": "mean", "wiki_semi": "mean", "wiki_hbm": "mean",
+              "naver_hynix": "mean", "naver_semi": "mean", "naver_hbm": "mean",
+              "naver_memory": "mean", "naver_samsung": "mean"}
 
 # The three fixtures are already stationary, so their natural transform is the
 # identity. Count-style signals (tweet volume, search volume) should default to
 # "zscore" — abnormality vs a rolling baseline — because raw counts on a growing
 # platform are non-stationary enough to produce a trend that looks like signal.
+#
+# The Naver signals must use dow_zscore, not merely should: under plain zscore
+# Monday's share of the top quintile measures 0.0% - Monday can never register
+# as high attention - against 21.2% under dow_zscore, where 20% is neutral.
+# "raw" is meaningless for them regardless; they are a 0-100 index, not a count.
 DEFAULT_TRANSFORM = {"noise": "raw", "planted": "raw", "past_return": "raw",
                      "wiki_hynix": "dow_zscore", "wiki_semi": "dow_zscore",
-                     "wiki_hbm": "dow_zscore"}
+                     "wiki_hbm": "dow_zscore",
+                     "naver_hynix": "dow_zscore", "naver_semi": "dow_zscore",
+                     "naver_hbm": "dow_zscore", "naver_memory": "dow_zscore",
+                     "naver_samsung": "dow_zscore"}
 
 
 def load_signal(name, px, kospi=None, **kwargs):

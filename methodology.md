@@ -56,6 +56,18 @@ Aggregation alone does not fix it — measured Monday shares: `sum` 83.5%, `mean
 previous-weekday 11.9%. **The baseline is the fix**: every aggregation paired with
 `dow_zscore` lands at 19.5–20.9%. Resolved as `agg="mean"` + `dow_zscore`.
 
+**The Naver signals have the same artifact with the opposite sign, and worse.** Weekend
+search runs at **12.4%** of weekday search, against Wikipedia's ~73%, so Monday's
+Fri+Sat+Sun bucket is *depressed* rather than inflated: aligned raw means are Mon 2.76 vs
+Tue–Fri 6.52/6.84/7.00/7.03. Under plain `zscore` **Monday's share of the top quintile is
+0.0%** — Monday cannot register as high attention at all — with mean z by weekday spanning
+2.02 and Monday at −1.40. `dow_zscore` returns it to **21.2%** with a range of 0.23.
+
+So the transform is not a preference for these signals but a correctness requirement, and
+the two artifacts together make the general point: a signal accumulated between market
+closes acquires a weekday bias whose *sign* depends on how weekend activity compares to
+weekday activity. Measure it before choosing the transform rather than assuming a direction.
+
 **`dow_zscore` has fat tails, by construction.** Its baseline is `window // 5`
 same-weekday observations — 4 at the default window of 20. A 4-point standard deviation
 occasionally collapses, and a real spike then divides by almost nothing: 2025-12-05 had

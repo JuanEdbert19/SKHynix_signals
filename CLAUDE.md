@@ -57,8 +57,9 @@ all reduce to one number per trading day, which is the only interface it require
 |---|---|
 | `quant/cache.py` | `CACHE_DIR` + `cached(path, fetch)` — the parquet cache, shared by every loader |
 | `quant/prices.py` | OHLCV for `000660` (pykrx), KOSPI and any yfinance symbol; plus `rebase` |
-| `quant/wiki.py` | Wikipedia pageviews per UTC calendar day; the real signal source |
-| `quant/align.py` | UTC signal timestamps → KRX trading date. **The only module with timezone logic** |
+| `quant/wiki.py` | Wikipedia pageviews per UTC calendar day |
+| `quant/naver.py` | Naver search trends per KST calendar day, read from hand-exported `.xlsx` |
+| `quant/align.py` | UTC **and KST** signal timestamps → KRX trading date. **The only module with timezone logic** |
 | `quant/panel.py` | Forward-return targets and signal transforms |
 | `quant/signals.py` | Signal registry + the three validation fixtures |
 | `quant/stats.py` | Rank IC, quantile buckets, Newey-West regressions, reverse causality |
@@ -98,9 +99,31 @@ already stationary. See `methodology.md`.
 | `wiki_semi` | `en:Semiconductor` | secondary — industry attention |
 | `wiki_hbm` | `en:High_Bandwidth_Memory` | secondary — product-story attention |
 
-Naming one primary in advance is what keeps "one fixed specification means one test" true
-with three signals registered. If all three are ever quoted as findings, the Bonferroni
-correction removed alongside the horizon grid has to come back with them.
+**Real signals (Naver search trends, Korean):**
+
+| Signal | Topic | Role |
+|---|---|---|
+| `naver_hynix` | SK하이닉스 + 주가 + ticker | **primary** — investor attention, fixed before running |
+| `naver_semi` | 반도체 | secondary — industry attention |
+| `naver_hbm` | HBM | secondary — product-story attention |
+| `naver_memory` | D램 / 낸드 | secondary — the earnings driver |
+| `naver_samsung` | 삼성전자 | **CONTROL — never a finding.** Registered only to be inspectable |
+
+The source `.xlsx` files in `data/` are downloaded by hand and **gitignored**, so a fresh
+clone has none of them. `data-sources.md` holds the query permalinks that regenerate them,
+and what the 0–100 index is.
+
+Naming one primary per family in advance is what keeps "one fixed specification means one
+test" true with eight real signals registered. If more than one is ever quoted as a
+finding, the Bonferroni correction removed alongside the horizon grid has to come back
+with them.
+
+**KST day → trading day.** Naver returns one number per **KST** calendar day.
+`align.daily_kst_to_timestamps` stamps each at `(D+1) 00:00 KST` — 8.5h after the 06:30 UTC
+close — so day *D* lands on trading day *D+1*, averaging Fri/Sat/Sun into Monday. Verified:
+signal[t] equals the mean of raw values over `[previous session, t−1 day]`, with **zero
+same-day leaks across 1,864 trading days**. Its docstring records why it exists rather than
+reusing the UTC function.
 
 **UTC day → trading day.** The pageviews API returns one integer per UTC calendar day; KRX
 closes at 06:30 UTC. `align.daily_utc_to_timestamps` stamps each day at `(D+1) 00:00 UTC` —
@@ -115,8 +138,10 @@ honest: `fwd_ret` target (raw), horizon 3, and the signal's registered
 signals). Everything else is explicitly secondary.
 
 **Deliberately narrow output.** Phase 1 reports rank IC, HAC t, HAC p, the
-top-minus-bottom quintile spread, n, the quintile table and the reverse-causality
-panel — nothing else. Scope was cut on 2026-08-10 (developer's call) by removing the
+top-minus-bottom quintile spread with its own HAC t, p and n, the full-sample n, the
+quintile table and the reverse-causality panel — nothing else. The spread's `ls_n` is
+reported because that test uses only the extreme buckets (~40% of the days), so quoting
+it beside the full-sample `n` would misstate what it was measured on. Scope was cut on 2026-08-10 (developer's call) by removing the
 multi-horizon grid, the Bonferroni threshold, `coef`, `t_ols_naive`, the cumulative
 long-short curve, the `fwd_vol` / `fwd_volrat` targets and the `diff` / `logdiff` /
 `pctrank` transforms. Two targets remain (`fwd_ret`, `fwd_exret`). Transforms were cut to two

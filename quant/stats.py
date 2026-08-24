@@ -147,5 +147,10 @@ def evaluate(panel, horizon=3, target="fwd_ret", q=5):
         "p_hac": reg["p"],
         "ls_spread": ls["spread"],
         "ls_t": ls["t"],
+        "ls_p": ls["p"],
+        # The long-short test runs on the extreme buckets only, so its sample is
+        # much smaller than `n`. Reporting the spread beside the full-sample n
+        # implies it was measured on all of it.
+        "ls_n": ls["n"],
         "n": reg["n"],
     }

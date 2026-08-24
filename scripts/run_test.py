@@ -58,7 +58,8 @@ def main():
     print(f"\n  rank IC       {res['ic']:+.4f}")
     print(f"  HAC t         {res['t_hac']:+.2f}")
     print(f"  HAC p         {res['p_hac']:.4f}")
-    print(f"  top-bottom    {res['ls_spread']:+.4f}  (t={res['ls_t']:+.2f})")
+    print(f"  top-bottom    {res['ls_spread']:+.4f}  (t={res['ls_t']:+.2f}  "
+          f"p={res['ls_p']:.4f}  n={int(res['ls_n']):,} extreme-bucket days)")
     print(f"  observations  {res['n']:,}")
     print("\n  " + ("significant at p<0.05" if res["p_hac"] < stats.ALPHA
                     else "no significant relationship"))
