@@ -59,15 +59,28 @@ def _load_yf(symbol, start, end, prefix):
     path = CACHE_DIR / f"{prefix}_{symbol}_{start}_{end}.parquet"
 
     def fetch():
+        import time
+
         import yfinance as yf
 
-        raw = yf.download(symbol, start=start, end=end, progress=False,
-                          auto_adjust=False)
-        # yfinance answers an unknown symbol with an empty frame rather than an
-        # error, and cached() would write that emptiness to parquet and serve it
-        # forever. Raising keeps a typo out of the cache.
+        # yfinance returns an empty frame both for an unknown symbol and for a
+        # throttled request, and it throttles readily when several symbols are
+        # fetched at once. One retry separates the two, so a rate limit does not
+        # get reported to the user as "this ticker does not exist".
+        for attempt in (0, 1):
+            raw = yf.download(symbol, start=start, end=end, progress=False,
+                              auto_adjust=False)
+            if not raw.empty:
+                break
+            if attempt == 0:
+                time.sleep(2)
+        # cached() would write that emptiness to parquet and serve it forever, so
+        # raising is what keeps a typo out of the cache.
         if raw.empty:
-            raise ValueError(f"no data for {symbol!r} over {start}..{end}")
+            raise ValueError(
+                f"no data for {symbol!r} over {start}..{end} — either the symbol "
+                "does not exist or the request was rate-limited; try again"
+            )
         if isinstance(raw.columns, pd.MultiIndex):
             raw.columns = raw.columns.droplevel(-1)
         raw = raw.rename(columns=str.lower)[["open", "high", "low", "close", "volume"]]

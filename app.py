@@ -301,47 +301,67 @@ with tab_price:
              "The listed companies are only shortcuts.",
     )
 
-    lines = {}
+    # A slider, not an interactive zoom. Vega keeps selection state per chart
+    # element across Streamlit reruns, and a stale or empty scale-bound domain
+    # clips the axis with no gesture from the user — which looks exactly like
+    # missing data. A window computed in Python renders the same every time.
+    d0, d1 = px.index[0].date(), px.index[-1].date()
+    lo, hi = st.slider("Window", min_value=d0, max_value=d1, value=(d0, d1),
+                       format="YYYY-MM-DD")
+    win = px.loc[(px.index >= pd.Timestamp(lo)) & (px.index <= pd.Timestamp(hi))]
+    if len(win) < 2:
+        # The Price tab is the last thing rendered, so stopping here costs nothing
+        # and avoids indenting the rest of the tab behind an else.
+        st.warning("Pick a window covering at least two trading days.")
+        st.stop()
+
+    lines, spans = {}, {}
     for choice in picked:
         sym = choice.split()[0] if choice.split() else ""
         try:
             peer = get_quote(sym, start, end)
         except Exception as exc:
-            st.warning(f"Could not load `{sym}` — {exc}")
+            # Loud, because the alternative symptom is a legend entry with no
+            # line, which reads as "this company has no data for the period".
+            st.error(f"**`{sym}` is not plotted.** {exc}", icon="🚫")
             continue
-        # Onto the KRX calendar first, then filled, then rebased.
         label = f"{PEER_NAME[sym]} ({sym})" if sym in PEER_NAME else sym
-        lines[label] = prices.rebase(peer.reindex(px.index).ffill())
+        # Span of genuine observations, before any filling, for the notices below.
+        spans[label] = (peer.index.min(), peer.index.max())
+        # Fill across the whole calendar first so the window's first day inherits
+        # the last price known before it, then cut to the window.
+        lines[label] = peer.reindex(px.index).ffill().loc[win.index]
 
-    # With no overlay there is nothing to compare against, so the raw KRW level is
-    # strictly more informative than an index. The axis title says which is shown.
+    # With no overlay there is nothing to compare against, so raw KRW is strictly
+    # more informative than an index. The axis title says which is shown.
     rebased = bool(lines)
-    hynix = prices.rebase(px["close"]) if rebased else px["close"]
-    y_title = (f"Rebased to 100 at {px.index[0].date()}" if rebased
+    lines = {"SK Hynix (000660)": win["close"], **lines}
+    if rebased:
+        # Rebase after windowing, so every line is 100 at the window start and
+        # narrowing the window re-anchors the comparison.
+        lines = {k: prices.rebase(s) for k, s in lines.items()}
+    y_title = (f"Rebased to 100 at {win.index[0].date()}" if rebased
                else "Close (KRW)")
 
-    lines = {"SK Hynix (000660)": hynix, **lines}
+    # Both ends matter. A ticker listed mid-window has no line before it existed;
+    # one that stops early gets its last price carried forward by the ffill above,
+    # which draws a flat line indistinguishable from a real quiet period.
+    notes = []
+    for k, (first, last) in spans.items():
+        if (first - win.index[0]).days > LATE_START_DAYS:
+            notes.append(f"**{k}** starts {first.date()}")
+        if (win.index[-1] - last).days > LATE_START_DAYS:
+            notes.append(f"**{k}** ends {last.date()} — the flat tail after that "
+                         "is its last price carried forward, not real trading")
+    if notes:
+        st.info("Not every line covers the whole window: " + " · ".join(notes),
+                icon="ℹ️")
 
-    # A ticker listed after the window opens is rebased to its own first day, not
-    # to the window start, so its 100 sits at a different date from everyone
-    # else's. Silently plotted, that reads as a common starting point.
-    late = {k: s.first_valid_index() for k, s in lines.items()}
-    late = {k: d for k, d in late.items()
-            if d is not None and (d - px.index[0]).days > LATE_START_DAYS}
-    if late:
-        st.info(
-            "Not all lines share a starting point — these begin at 100 on a later "
-            "date, so their level is growth since **their** first day, not since "
-            + f"{px.index[0].date()}: "
-            + " · ".join(f"**{k}** {d.date()}" for k, d in late.items()),
-            icon="ℹ️",
-        )
     pr = pd.concat(
         [s.rename("value").reset_index().assign(series=k) for k, s in lines.items()]
     )
-    vol = px[["volume"]].reset_index()
+    vol = win[["volume"]].reset_index()
 
-    zoom = alt.selection_interval(bind="scales", encodings=["x"])
     line = alt.Chart(pr).mark_line(strokeWidth=1.4).encode(
         x=alt.X("date:T", title=None),
         # Log, not linear: the stock has multiplied several times over the sample,
@@ -361,7 +381,7 @@ with tab_price:
         tooltip=[alt.Tooltip("date:T", title="Date"),
                  alt.Tooltip("series:N", title="Series"),
                  alt.Tooltip("value:Q", title=y_title, format=",.1f")],
-    ).properties(height=340, title="Close, log scale").add_params(zoom)
+    ).properties(height=340, title="Close, log scale")
 
     bars = alt.Chart(vol).mark_bar(color=SERIES, opacity=0.5).encode(
         x=alt.X("date:T", title=None),
@@ -383,7 +403,8 @@ with tab_price:
         "Close on a **log axis**, so equal percentage moves are equal vertical "
         "distances. Unadjusted close — **not** back-adjusted for dividends or "
         "splits, so this is a price chart, not a total-return chart. "
-        "Scroll or drag to zoom; both panels share the date axis."
+        "Use the **Window** slider to narrow the date range — both panels always "
+        "show the same span."
     )
     if rebased:
         caption += (

@@ -352,17 +352,47 @@ def test_invalid_symbol_is_rejected_before_any_fetch_or_cache_write(monkeypatch)
 
 def test_empty_download_raises_rather_than_caching_emptiness(monkeypatch, tmp_path):
     """yfinance answers a bad-but-well-formed symbol with an empty frame."""
+    import time
     import types
 
     monkeypatch.setattr(prices, "CACHE_DIR", tmp_path)
+    calls = []
     fake = types.SimpleNamespace(
-        download=lambda *a, **k: pd.DataFrame()
+        download=lambda *a, **k: calls.append(1) or pd.DataFrame()
     )
     monkeypatch.setitem(sys.modules, "yfinance", fake)
+    monkeypatch.setattr(time, "sleep", lambda _: None)
 
     with pytest.raises(ValueError, match="no data for"):
         prices.load_quote("NOTATICKER")
+    assert len(calls) == 2, "an empty result must be retried once before giving up"
     assert not list(tmp_path.glob("*.parquet")), "an empty frame was cached"
+
+
+def test_a_throttled_first_attempt_is_retried_not_reported_as_missing(monkeypatch,
+                                                                     tmp_path):
+    """The failure that made Shin-Etsu look like it had no data."""
+    import time
+    import types
+
+    monkeypatch.setattr(prices, "CACHE_DIR", tmp_path)
+    good = pd.DataFrame(
+        {"Open": [1.0], "High": [1.0], "Low": [1.0], "Close": [7.0],
+         "Volume": [10]},
+        index=pd.DatetimeIndex(["2024-01-02"]),
+    )
+    tries = []
+
+    def flaky(*a, **k):
+        tries.append(1)
+        return pd.DataFrame() if len(tries) == 1 else good
+
+    monkeypatch.setitem(sys.modules, "yfinance", types.SimpleNamespace(download=flaky))
+    monkeypatch.setattr(time, "sleep", lambda _: None)
+
+    out = prices.load_quote("4063.T")
+    assert len(tries) == 2
+    assert out["close"].tolist() == [7.0]
 
 
 # --- price cross-check (network) -------------------------------------------
