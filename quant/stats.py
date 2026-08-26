@@ -157,6 +157,52 @@ def tail_curve(sig, fwd, maxlags, thresholds=TAIL_GRID):
     return pd.DataFrame(rows)
 
 
+def event_metrics(sig, fwd, maxlags, threshold=TAIL_Z):
+    """Discrete summary of outlier days, with a HAC-tested hit rate.
+
+    The hit rate is measured against the MEDIAN of non-event days, not of all
+    days, so event days are not inside their own benchmark. That also makes
+    base_rate ~0.50 by construction, which is what turns hit_rate into a
+    readable number rather than an arbitrary one.
+
+    hit_diff comes from a linear probability model: regressing the 0/1 outcome
+    "beat the baseline" on the 0/1 event dummy gives a coefficient that IS the
+    difference in hit rates, and ols_hac supplies an autocorrelation-robust
+    standard error for it. A binomial test would be wrong here - overlapping
+    forward windows are not independent trials - which is the same reason
+    rank_ic ships without a p-value.
+    """
+    x, y = _pair(sig, fwd)
+    ev = x > threshold
+    n_events = int(ev.sum())
+    nan = {k: np.nan for k in ("mean_event", "mean_rest", "median_rest", "hit_rate",
+                               "base_rate", "hit_diff", "hit_t", "hit_p", "abs_ratio")}
+    if n_events < 20 or n_events == len(x):
+        return {"n_events": n_events, "n_rest": len(x) - n_events, **nan}
+
+    hit_on, hit_off = y[ev], y[~ev]
+    median_rest = float(hit_off.median())
+    beat = (y > median_rest).astype(float)
+    reg = ols_hac(beat, ev.astype(float), maxlags=maxlags, standardize=False)
+
+    return {
+        "n_events": n_events,
+        "n_rest": len(x) - n_events,
+        "mean_event": float(hit_on.mean()),
+        "mean_rest": float(hit_off.mean()),
+        "median_rest": median_rest,
+        "hit_rate": float((hit_on > median_rest).mean()),
+        "base_rate": float((hit_off > median_rest).mean()),
+        "hit_diff": reg["coef"],
+        "hit_t": reg["t"],
+        "hit_p": reg["p"],
+        # Descriptive only. Records whether outlier days carry larger moves in
+        # either direction; no inference is run on it and no absolute-return
+        # target exists. Backs the magnitude claim in methodology.md.
+        "abs_ratio": float(hit_on.abs().mean() / hit_off.abs().mean()),
+    }
+
+
 def reverse_causality(sig, past, maxlags=3):
     """Does price predict the signal? Regress the signal on trailing returns.
 
@@ -187,6 +233,7 @@ def evaluate(panel, horizon=3, target="fwd_ret", q=5, tail_z=TAIL_Z):
     reg = ols_hac(fwd, sig, maxlags=horizon)
     ls = long_short(sig, fwd, maxlags=horizon, q=q)
     tail = tail_test(sig, fwd, maxlags=horizon, threshold=tail_z)
+    ev = event_metrics(sig, fwd, maxlags=horizon, threshold=tail_z)
     return {
         "horizon": horizon,
         "target": target,
@@ -206,5 +253,6 @@ def evaluate(panel, horizon=3, target="fwd_ret", q=5, tail_z=TAIL_Z):
         "tail_t": tail["t"],
         "tail_p": tail["p"],
         "tail_n": tail["n_tail"],
+        **{f"ev_{k}": v for k, v in ev.items()},
         "n": reg["n"],
     }

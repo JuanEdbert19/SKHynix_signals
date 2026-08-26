@@ -79,6 +79,17 @@ def main():
     print(f"  HAC p         {res['tail_p']:.4f}")
     print(f"  tail days     {int(res['tail_n']):,} of {int(res['n']):,}")
 
+    print("\n  event metrics")
+    print(f"    events        {int(res['ev_n_events']):,} vs {int(res['ev_n_rest']):,} others")
+    print(f"    mean return   {res['ev_mean_event']:+.4f} on events, "
+          f"{res['ev_mean_rest']:+.4f} otherwise")
+    print(f"    hit rate      {res['ev_hit_rate']:.1%} vs {res['ev_base_rate']:.1%} baseline "
+          f"(diff {res['ev_hit_diff']:+.1%}, t={res['ev_hit_t']:+.2f}, "
+          f"p={res['ev_hit_p']:.4f})")
+    print(f"    baseline      median return on non-event days = {res['ev_median_rest']:+.4f}")
+    print(f"    mean |return| {res['ev_abs_ratio']:.2f}x that of other days "
+          "(descriptive, untested)")
+
     print("\n  threshold sensitivity (the cut was chosen after inspecting results,")
     print("  so judge it against this column, not on its own):")
     print("     cut   excess       t        p   tail   rest")

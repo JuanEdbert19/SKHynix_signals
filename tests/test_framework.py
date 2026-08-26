@@ -831,3 +831,95 @@ def test_evaluate_exposes_the_tail_result():
         assert k in res, f"evaluate dropped {k}"
     assert res["tail_z"] == 1.0
     assert res["tail_n"] < res["n"]
+
+
+# --- event metrics for outlier days -----------------------------------------
+
+
+def test_event_metrics_uses_the_whole_sample():
+    pnl = build("planted", seed=0)
+    e = stats.event_metrics(pnl["signal"], pnl["fwd_ret_3"], maxlags=3, threshold=1.0)
+    full = stats.ols_hac(pnl["fwd_ret_3"], pnl["signal"], maxlags=3)
+    assert e["n_events"] + e["n_rest"] == full["n"]
+
+
+def test_event_mean_difference_agrees_with_tail_test():
+    """Two functions computing the same quantity must not disagree."""
+    pnl = build("planted", seed=0)
+    e = stats.event_metrics(pnl["signal"], pnl["fwd_ret_3"], maxlags=3, threshold=1.0)
+    t = stats.tail_test(pnl["signal"], pnl["fwd_ret_3"], maxlags=3, threshold=1.0)
+    assert e["mean_event"] - e["mean_rest"] == pytest.approx(t["excess"], abs=1e-9)
+
+
+def test_hit_diff_is_the_difference_in_hit_rates():
+    """The LPM coefficient must be the hit-rate difference, not something else.
+
+    This is what makes the HAC t and p attach to the number on screen. A
+    misspecified regression would still return a plausible t.
+    """
+    pnl = build("planted", seed=0)
+    e = stats.event_metrics(pnl["signal"], pnl["fwd_ret_3"], maxlags=3, threshold=1.0)
+    assert e["hit_diff"] == pytest.approx(e["hit_rate"] - e["base_rate"], abs=1e-9)
+
+
+def test_base_rate_is_a_half_by_construction():
+    """The baseline is the non-event median, so ~50% of them beat it.
+
+    Pinned because it is what makes hit_rate readable: any departure from 50%
+    on the comparison group means the baseline is not what it claims to be.
+    """
+    for name, seed in (("planted", 0), ("noise", 5), ("past_return", 0)):
+        pnl = build(name, seed=seed)
+        e = stats.event_metrics(pnl["signal"], pnl["fwd_ret_3"], maxlags=3,
+                                threshold=pnl["signal"].quantile(0.9))
+        assert abs(e["base_rate"] - 0.5) < 0.02, (name, e["base_rate"])
+
+
+def test_event_metrics_detect_the_planted_effect():
+    pnl = build("planted", seed=0)
+    e = stats.event_metrics(pnl["signal"], pnl["fwd_ret_3"], maxlags=3, threshold=1.0)
+    assert e["mean_event"] > e["mean_rest"]
+    assert e["hit_rate"] > e["base_rate"]
+
+
+def test_the_hit_rate_has_less_power_than_the_mean():
+    """Measured, and a caveat worth pinning rather than discovering later.
+
+    Collapsing every return to a 0/1 "beat the median" throws away magnitude, so
+    the same known rho=0.15 effect that the mean test clears at p=0.015 leaves
+    the hit rate at p=0.142 on identical data. The hit rate is a supporting
+    statistic, never a headline one.
+    """
+    pnl = build("planted", seed=0)
+    mean_test = stats.tail_test(pnl["signal"], pnl["fwd_ret_3"], maxlags=3,
+                                threshold=1.0)
+    e = stats.event_metrics(pnl["signal"], pnl["fwd_ret_3"], maxlags=3, threshold=1.0)
+
+    assert mean_test["p"] < 0.05, "the mean test should detect the fixture"
+    assert e["hit_rate"] > e["base_rate"], "the hit rate should still point the right way"
+    assert e["hit_p"] > mean_test["p"], (
+        f"hit rate p={e['hit_p']:.4f} was not weaker than mean p={mean_test['p']:.4f}"
+    )
+
+
+def test_event_metrics_read_null_on_noise():
+    pnl = build("noise", seed=11)
+    e = stats.event_metrics(pnl["signal"], pnl["fwd_ret_3"], maxlags=3, threshold=1.0)
+    assert e["hit_p"] > 0.05
+    assert abs(e["hit_rate"] - e["base_rate"]) < 0.1
+
+
+def test_event_metrics_return_nan_when_no_events():
+    """Reachable: a raw-transform signal whose values all sit above the cut."""
+    pnl = build("noise", seed=3)
+    e = stats.event_metrics(pnl["signal"], pnl["fwd_ret_3"], maxlags=3, threshold=99.0)
+    assert e["n_events"] == 0
+    assert np.isnan(e["hit_rate"]) and np.isnan(e["abs_ratio"])
+
+
+def test_evaluate_exposes_the_event_metrics():
+    res = stats.evaluate(build("planted", seed=0), horizon=3, tail_z=1.0)
+    for k in ("ev_n_events", "ev_mean_event", "ev_mean_rest", "ev_hit_rate",
+              "ev_base_rate", "ev_hit_p", "ev_abs_ratio"):
+        assert k in res, f"evaluate dropped {k}"
+    assert res["ev_n_events"] + res["ev_n_rest"] == res["n"]

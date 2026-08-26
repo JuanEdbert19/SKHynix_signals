@@ -113,12 +113,38 @@ Measured on `naver_hynix` at `dow_zscore > 2.5`: **+1.02% excess over 3 days, HA
 p = 0.0119, 196 tail days** — against a full-sample rank IC of +0.029 with p = 0.573 on the
 same data. The gap between those two numbers is the entire justification for the function.
 
-**The magnitude version of the hypothesis was tested first and rejected.** The motivating
-idea was that an outlier day produces a large move in *either* direction. Mean |3-day return|
-on outlier days relative to all days: `naver_hynix` 0.94–0.99×, `naver_semi` 0.96–1.00×,
-`naver_memory` 0.83–0.88×, `wiki_hynix` 0.88–0.92×. No amplification anywhere, and
-`naver_memory` outlier days are *calmer* than average. This is why the target stayed signed
-`fwd_ret` and why `fwd_vol` was not re-added for it.
+**The magnitude version of the hypothesis is not supported.** The motivating idea was that an
+outlier day produces a large move in *either* direction. `stats.event_metrics` reports
+`abs_ratio` — mean |forward return| on event days divided by the same on non-event days — and
+at the registered cut it lands at 0.95 (`naver_hynix`), 1.01 (`naver_semi`), 0.96
+(`naver_hbm`), 0.86 (`naver_memory`) and 0.87 (`wiki_hynix`). No amplification anywhere, and
+two signals are *calmer* on event days. This is why the target stayed signed `fwd_ret` and no
+absolute-return target was added.
+
+`abs_ratio` is descriptive and carries no inference, deliberately: an absolute-return
+regression would need |cumulative return| as its dependent variable, which is a poor
+volatility measure. It correlates only 0.667 with realized volatility over the same window —
+2.2% of days sit in the bottom quartile of |cumulative| while in the top quartile of realized
+vol, violent paths that happened to end near where they started — and it is contaminated by
+drift (`corr(|cum|, cum) = +0.138` against +0.080 for realized vol). Testing magnitude
+properly needs a realized-volatility target, not this one.
+
+**The hit rate uses a linear probability model, not a binomial test.** `event_metrics`
+regresses the 0/1 outcome "beat the non-event median" on the 0/1 event dummy, so the
+coefficient *is* the difference in hit rates and inherits the same HAC correction as
+everything else. A binomial test would assume independent trials, which overlapping 3-day
+windows are not — the same objection that keeps a p-value off `rank_ic`.
+
+The baseline is the median of *non-event* days rather than of all days, which puts the
+comparison group's own hit rate at ~50% by construction and makes the event rate readable
+against it. Pinned by a test.
+
+**The hit rate has materially less power than the mean, and must not be read alone.**
+Collapsing every return to a 0/1 outcome discards magnitude, so a large number of
+barely-above-median days scores identically to a few enormous ones. Measured on the `planted`
+fixture (ρ = 0.15): the mean test clears at p = 0.015 while the hit rate on the same data
+reaches only p = 0.142, pointing the right way (56.0% vs 50.0%) but far short of
+significance. Pinned by `test_the_hit_rate_has_less_power_than_the_mean`.
 
 **`TAIL_Z = 2.5` was chosen after inspecting results, and that is a real limitation.**
 Sixteen signal × threshold combinations were run before the value was picked; a Bonferroni

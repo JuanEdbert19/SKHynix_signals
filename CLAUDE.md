@@ -139,7 +139,7 @@ signals). Everything else is explicitly secondary.
 
 **Deliberately narrow output.** Phase 1 reports rank IC, HAC t, HAC p, the
 top-minus-bottom quintile spread with its own HAC t, p and n, the full-sample n, the
-quintile table, the tail test and the reverse-causality panel — nothing else. The spread's
+quintile table, the tail test with its event metrics, and the reverse-causality panel — nothing else. The spread's
 `ls_n` is reported because that test uses only the extreme buckets (~40% of the days), so
 quoting it beside the full-sample `n` would misstate what it was measured on.
 

@@ -299,6 +299,31 @@ with tab_signal:
                  help=f"{tail['n_tail'] / max(len(tl), 1):.1%} of the {len(tl):,} "
                       "usable days. The rest form the comparison group.")
 
+    ev = stats.event_metrics(tl["signal"], tl["fwd"], maxlags=horizon,
+                             threshold=tail_z)
+    ec = st.columns(4)
+    ec[0].metric("Mean return, event days", f"{ev['mean_event']:+.4f}",
+                 help=f"{ev['n_events']:,} days above the threshold.")
+    ec[1].metric("Mean return, other days", f"{ev['mean_rest']:+.4f}",
+                 help=f"{ev['n_rest']:,} days. The difference between these two is "
+                      "the excess return above.")
+    ec[2].metric("Hit rate, event days", f"{ev['hit_rate']:.1%}",
+                 delta=f"{ev['hit_diff']:+.1%} vs baseline",
+                 delta_color="normal" if ev["hit_p"] < stats.ALPHA else "off",
+                 help=f"Share of event days beating the median return of "
+                      f"non-event days ({ev['median_rest']:+.4f}). HAC "
+                      f"t = {ev['hit_t']:+.2f}, p = {ev['hit_p']:.4f}.")
+    ec[3].metric("Hit rate, other days", f"{ev['base_rate']:.1%}",
+                 help="~50% by construction — the baseline is these days' own "
+                      "median, which is what makes the event rate readable.")
+    st.caption(
+        f"Mean |return| on event days is **{ev['abs_ratio']:.2f}×** that of other "
+        "days — descriptive only, no test is run on it. Above 1 would support "
+        "outliers acting as volatility catalysts; at or below 1 they do not. "
+        "The hit rate discards magnitude entirely, so read it beside the mean "
+        "rather than alone."
+    )
+
     sig_line = alt.Chart(tl).mark_line(color=MUTED, strokeWidth=0.7,
                                        opacity=0.7).encode(
         x=alt.X("date:T", title=None),
@@ -322,14 +347,12 @@ with tab_signal:
                   "coloured by the return that followed"), height=260),
         width="stretch",
     )
-    if len(marks):
-        up = (marks["direction"] == "up").mean()
-        st.caption(
-            f"**{up:.0%} of tail days were followed by a gain** over {horizon} days "
-            f"(vs {(tl['fwd'] >= 0).mean():.0%} across all days). Mixed colours mean "
-            "the spikes carry no directional information; a one-sided cluster means "
-            "they do."
-        )
+    st.caption(
+        "Green marks are event days followed by a gain, red by a loss. A mixed "
+        "scatter means the spikes carry no directional information; a one-sided "
+        "cluster means they do. The hit rate above measures this against the "
+        "baseline median rather than against zero."
+    )
 
     st.markdown("**Threshold sensitivity**")
     # Same scale problem as the slider: the registered grid is in z units, so it
