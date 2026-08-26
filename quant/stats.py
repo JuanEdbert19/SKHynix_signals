@@ -13,6 +13,15 @@ import statsmodels.api as sm
 
 ALPHA = 0.05
 
+# Cut defining a "tail" day for tail_test, in transformed-signal units.
+#
+# CHOSEN AFTER INSPECTING RESULTS - 16 signal x threshold combinations were run
+# before this value was picked, so a p-value from it alone overstates the
+# evidence (a Bonferroni threshold across those is 0.0031). tail_curve exists as
+# the mitigation and is reported alongside it, never instead of it.
+TAIL_Z = 2.5
+TAIL_GRID = (1.0, 1.5, 2.0, 2.5, 3.0, 3.5)
+
 
 def _pair(x, y):
     df = pd.concat([x.rename("x"), y.rename("y")], axis=1).dropna()
@@ -110,6 +119,44 @@ def long_short(sig, fwd, maxlags, q=5):
     return {"spread": res["coef"], "t": res["t"], "p": res["p"], "n": res["n"]}
 
 
+def tail_test(sig, fwd, maxlags, threshold=TAIL_Z):
+    """Mean forward return on high-signal days versus every other day.
+
+    Two deliberate differences from long_short, and both are why this exists:
+
+    One-sided. long_short compares the top quantile against the *bottom* one,
+    which is the right test for a monotonic relationship. If instead the
+    hypothesis is "a spike moves the stock", quiet days are the absence of a
+    spike rather than its opposite, so the comparison is tail vs everything.
+
+    Full sample. long_short discards the middle 60%; this keeps every day, so
+    n_tail + n_rest equals the n reported elsewhere.
+    """
+    x, y = _pair(sig, fwd)
+    dummy = (x > threshold).astype(float)
+    n_tail = int(dummy.sum())
+    if n_tail < 20 or n_tail == len(x):
+        return {"excess": np.nan, "t": np.nan, "p": np.nan,
+                "n_tail": n_tail, "n_rest": len(x) - n_tail}
+
+    res = ols_hac(y, dummy, maxlags=maxlags, standardize=False)
+    return {"excess": res["coef"], "t": res["t"], "p": res["p"],
+            "n_tail": n_tail, "n_rest": len(x) - n_tail}
+
+
+def tail_curve(sig, fwd, maxlags, thresholds=TAIL_GRID):
+    """tail_test across a grid of cuts.
+
+    Not a convenience wrapper. TAIL_Z was chosen after inspecting results, so a
+    single p-value from it overstates the evidence; showing the whole curve is
+    what lets a reader see whether the chosen cut sits on a plateau or on a
+    lone spike. It is rendered unconditionally for that reason.
+    """
+    rows = [{"threshold": t, **tail_test(sig, fwd, maxlags, threshold=t)}
+            for t in thresholds]
+    return pd.DataFrame(rows)
+
+
 def reverse_causality(sig, past, maxlags=3):
     """Does price predict the signal? Regress the signal on trailing returns.
 
@@ -123,7 +170,7 @@ def reverse_causality(sig, past, maxlags=3):
     return out
 
 
-def evaluate(panel, horizon=3, target="fwd_ret", q=5):
+def evaluate(panel, horizon=3, target="fwd_ret", q=5, tail_z=TAIL_Z):
     """The headline result for one specification.
 
     One horizon, one target, one transform — the specification is fixed before
@@ -139,6 +186,7 @@ def evaluate(panel, horizon=3, target="fwd_ret", q=5):
     # signal_not_the_reverse inspects the call arguments instead.
     reg = ols_hac(fwd, sig, maxlags=horizon)
     ls = long_short(sig, fwd, maxlags=horizon, q=q)
+    tail = tail_test(sig, fwd, maxlags=horizon, threshold=tail_z)
     return {
         "horizon": horizon,
         "target": target,
@@ -152,5 +200,11 @@ def evaluate(panel, horizon=3, target="fwd_ret", q=5):
         # much smaller than `n`. Reporting the spread beside the full-sample n
         # implies it was measured on all of it.
         "ls_n": ls["n"],
+        # Tail: one-sided, full sample. Exploratory - see TAIL_Z.
+        "tail_z": tail_z,
+        "tail_excess": tail["excess"],
+        "tail_t": tail["t"],
+        "tail_p": tail["p"],
+        "tail_n": tail["n_tail"],
         "n": reg["n"],
     }

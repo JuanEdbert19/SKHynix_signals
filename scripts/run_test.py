@@ -34,6 +34,8 @@ def main():
     ap.add_argument("--end", default="2026-08-06")
     ap.add_argument("--window", type=int, default=20, help="z-score baseline window")
     ap.add_argument("--quantiles", type=int, default=5)
+    ap.add_argument("--tail-z", type=float, default=stats.TAIL_Z, dest="tail_z",
+                    help="outlier cut for the tail test, in transformed-signal units")
     args = ap.parse_args()
 
     tkind = args.transform or signals.DEFAULT_TRANSFORM.get(args.signal, "zscore")
@@ -45,7 +47,9 @@ def main():
     pnl = panel_mod.build_panel(px, sig, transform_kind=tkind, window=args.window,
                                 kospi=kospi, horizon=args.horizon)
     res = stats.evaluate(pnl, horizon=args.horizon, target=args.target,
-                         q=args.quantiles)
+                         q=args.quantiles, tail_z=args.tail_z)
+    curve = stats.tail_curve(pnl["signal"], pnl[f"{args.target}_{args.horizon}"],
+                             maxlags=args.horizon)
     qt = stats.quantile_table(pnl["signal"], pnl[f"{args.target}_{args.horizon}"],
                               q=args.quantiles)
     rev = stats.reverse_causality(pnl["signal"], panel_mod.past_returns(pnl))
@@ -69,6 +73,19 @@ def main():
         print(f"  q{int(row['bucket'])}  mean={row['mean']:+.5f}  "
               f"se={row['se']:.5f}  n={int(row['n'])}")
 
+    print(f"\ntail test — days with signal > {args.tail_z:g} vs all others")
+    print(f"  excess ret    {res['tail_excess']:+.4f}")
+    print(f"  HAC t         {res['tail_t']:+.2f}")
+    print(f"  HAC p         {res['tail_p']:.4f}")
+    print(f"  tail days     {int(res['tail_n']):,} of {int(res['n']):,}")
+
+    print("\n  threshold sensitivity (the cut was chosen after inspecting results,")
+    print("  so judge it against this column, not on its own):")
+    print("     cut   excess       t        p   tail   rest")
+    for row in curve.to_dict(orient="records"):
+        print(f"    {row['threshold']:4.2f}  {row['excess']:+.4f}  {row['t']:+6.2f}  "
+              f"{row['p']:7.4f}  {int(row['n_tail']):5d}  {int(row['n_rest']):5d}")
+
     print("\nreverse causality — does past price predict the signal?")
     for k, v in rev.items():
         if v["degenerate"]:
@@ -85,6 +102,7 @@ def main():
                    "trading_days": len(pnl)},
         "result": res,
         "quantiles": qt.to_dict(orient="records"),
+        "tail_curve": curve.to_dict(orient="records"),
         "reverse_causality": rev,
         "run_utc": stamp,
     }, indent=2, default=float))

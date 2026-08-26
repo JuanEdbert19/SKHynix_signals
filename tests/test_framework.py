@@ -762,3 +762,72 @@ def test_naver_dow_artifact_is_real_and_dow_zscore_fixes_it():
 
     assert monday_share("zscore") < 0.05, "expected Monday to be locked out"
     assert 0.15 < monday_share("dow_zscore") < 0.25
+
+
+# --- tail (outlier) evaluation ----------------------------------------------
+
+
+def test_tail_test_detects_the_planted_effect():
+    """A fixture built to be detectable must fire here too."""
+    pnl = build("planted", seed=0)
+    r = stats.tail_test(pnl["signal"], pnl["fwd_ret_3"], maxlags=3, threshold=1.0)
+    assert r["excess"] > 0 and r["p"] < 0.05, r
+
+
+def test_tail_test_reads_null_on_noise():
+    pnl = build("noise", seed=11)
+    r = stats.tail_test(pnl["signal"], pnl["fwd_ret_3"], maxlags=3, threshold=1.0)
+    assert r["p"] > 0.05, r
+
+
+def test_tail_test_uses_the_whole_sample_unlike_long_short():
+    """long_short throws away the middle; this must not."""
+    pnl = build("planted", seed=0)
+    r = stats.tail_test(pnl["signal"], pnl["fwd_ret_3"], maxlags=3, threshold=1.0)
+    full = stats.ols_hac(pnl["fwd_ret_3"], pnl["signal"], maxlags=3)
+    assert r["n_tail"] + r["n_rest"] == full["n"]
+
+
+def test_tail_test_finds_what_rank_ic_dilutes():
+    """The reason the function exists.
+
+    A signal whose top decile carries a large effect and whose remaining 90% is
+    pure noise: rank IC averages the effect away across the flat majority, while
+    the tail test looks only where the effect lives.
+    """
+    px = fake_px()
+    pnl = panel.add_targets(px, horizon=3)
+    rng = np.random.default_rng(0)
+
+    sig = pd.Series(rng.standard_normal(len(px)), index=px.index)
+    fwd = pd.Series(rng.standard_normal(len(px)) * 0.02, index=px.index)
+    spike = sig > sig.quantile(0.90)
+    fwd[spike] += 0.05                      # effect ONLY in the tail
+
+    ic = abs(stats.rank_ic(sig, fwd))
+    tail = stats.tail_test(sig, fwd, maxlags=3, threshold=sig.quantile(0.90))
+    assert ic < 0.25, f"rank IC {ic:.3f} — the dilution premise does not hold"
+    assert tail["p"] < 0.001, tail
+    assert tail["excess"] > 0.03, tail
+
+
+def test_tail_test_returns_nan_when_the_tail_is_empty():
+    """A threshold above every observation must not raise."""
+    pnl = build("noise", seed=3)
+    r = stats.tail_test(pnl["signal"], pnl["fwd_ret_3"], maxlags=3, threshold=99.0)
+    assert r["n_tail"] == 0 and np.isnan(r["excess"])
+
+
+def test_tail_curve_covers_the_grid_and_shrinks_monotonically():
+    pnl = build("planted", seed=0)
+    c = stats.tail_curve(pnl["signal"], pnl["fwd_ret_3"], maxlags=3)
+    assert list(c["threshold"]) == list(stats.TAIL_GRID)
+    assert c["n_tail"].is_monotonic_decreasing, c[["threshold", "n_tail"]]
+
+
+def test_evaluate_exposes_the_tail_result():
+    res = stats.evaluate(build("planted", seed=0), horizon=3, tail_z=1.0)
+    for k in ("tail_z", "tail_excess", "tail_t", "tail_p", "tail_n"):
+        assert k in res, f"evaluate dropped {k}"
+    assert res["tail_z"] == 1.0
+    assert res["tail_n"] < res["n"]

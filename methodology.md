@@ -56,17 +56,29 @@ Aggregation alone does not fix it — measured Monday shares: `sum` 83.5%, `mean
 previous-weekday 11.9%. **The baseline is the fix**: every aggregation paired with
 `dow_zscore` lands at 19.5–20.9%. Resolved as `agg="mean"` + `dow_zscore`.
 
-**The Naver signals have the same artifact with the opposite sign, and worse.** Weekend
-search runs at **12.4%** of weekday search, against Wikipedia's ~73%, so Monday's
-Fri+Sat+Sun bucket is *depressed* rather than inflated: aligned raw means are Mon 2.76 vs
-Tue–Fri 6.52/6.84/7.00/7.03. Under plain `zscore` **Monday's share of the top quintile is
-0.0%** — Monday cannot register as high attention at all — with mean z by weekday spanning
-2.02 and Monday at −1.40. `dow_zscore` returns it to **21.2%** with a range of 0.23.
+**The Naver signals carry a far worse version of the same artifact**, and the two together
+show that the *severity* depends entirely on how quiet the weekend is. Weekend search runs
+at **12.4%** of weekday search, against Wikipedia's 73.5%, so under the same `agg="mean"`
+Monday's Fri+Sat+Sun bucket lands at 0.42× a weekday where Wikipedia's lands at 0.82×.
+Aligned raw means are Mon 2.76 against Tue–Fri 6.52/6.84/7.00/7.03.
 
-So the transform is not a preference for these signals but a correctness requirement, and
-the two artifacts together make the general point: a signal accumulated between market
-closes acquires a weekday bias whose *sign* depends on how weekend activity compares to
-weekday activity. Measure it before choosing the transform rather than assuming a direction.
+Monday's share of the top quintile, both under `agg="mean"`:
+
+| | plain `zscore` | `dow_zscore` |
+|---|---|---|
+| `wiki_hynix` | 4.3% | 19.5% |
+| `naver_hynix` | **0.0%** | 21.1% |
+
+At 0.0% a Monday cannot register as high attention *at all* — mean z by weekday spans 2.02
+with Monday at −1.40 against Friday's +0.61. The signal would then be partly encoding "today
+is not a Monday", which matters because SK Hynix has a real Monday return effect (+0.58% over
+3 days, t = +1.89): a regression would report a calendar artifact as attention.
+
+So `dow_zscore` is a correctness requirement here, not a preference. The general lesson is to
+measure the weekday profile of any signal bucketed between market closes before choosing a
+transform — the direction and size of the bias are properties of the source, not of the
+method. Note Wikipedia's *original* `agg="sum"` bug went the other way entirely (Monday
+inflated to 83.5%), so neither sign can be assumed in advance.
 
 **`dow_zscore` has fat tails, by construction.** Its baseline is `window // 5`
 same-weekday observations — 4 at the default window of 20. A 4-point standard deviation
@@ -86,6 +98,42 @@ back significant.
 summing Fri+Sat+Sun into Monday breaks up the short-lag structure. Both are correct
 measurements of different series — quote the aligned one when reasoning about the
 regression.
+
+## Tail evaluation
+
+**Whole-distribution statistics dilute an effect confined to the tail.** Rank IC asks
+whether the relationship is monotonic over every day; the HAC fit puts one line through all
+of them; the top−bottom spread compares two 20% blocks. If a signal only carries information
+when it spikes, the 80% of ordinary days average it away. `stats.tail_test` is the narrow
+question instead: mean forward return on days above a cut, versus every other day, as a HAC
+dummy regression on the full sample. It is one-sided by design — the hypothesis is "a spike
+moves the stock", and a quiet day is the absence of a spike rather than its opposite.
+
+Measured on `naver_hynix` at `dow_zscore > 2.5`: **+1.02% excess over 3 days, HAC t = +2.52,
+p = 0.0119, 196 tail days** — against a full-sample rank IC of +0.029 with p = 0.573 on the
+same data. The gap between those two numbers is the entire justification for the function.
+
+**The magnitude version of the hypothesis was tested first and rejected.** The motivating
+idea was that an outlier day produces a large move in *either* direction. Mean |3-day return|
+on outlier days relative to all days: `naver_hynix` 0.94–0.99×, `naver_semi` 0.96–1.00×,
+`naver_memory` 0.83–0.88×, `wiki_hynix` 0.88–0.92×. No amplification anywhere, and
+`naver_memory` outlier days are *calmer* than average. This is why the target stayed signed
+`fwd_ret` and why `fwd_vol` was not re-added for it.
+
+**`TAIL_Z = 2.5` was chosen after inspecting results, and that is a real limitation.**
+Sixteen signal × threshold combinations were run before the value was picked; a Bonferroni
+threshold across them is 0.0031, which p = 0.0119 fails. The mitigation is structural rather
+than a disclaimer: `stats.tail_curve` reports the whole grid and is rendered unconditionally
+beside the headline number, so a reader sees whether the cut sits on a plateau (2.0–3.5 are
+all significant for `naver_hynix`, which is reassuring) or on an isolated spike (which would
+not be). **No tail result is a finding until it is tested on data the threshold was not
+chosen on.**
+
+Two further cautions. `dow_zscore` has sd 3.84 rather than 1.0, so a fixed z is not a fixed
+percentile and `n_tail` must be read alongside any tail statistic. And the effect does not
+survive halving the sample — ≤2024 gives +0.72% (p = 0.092), 2025–26 gives +1.26%
+(p = 0.187) — which is equally consistent with a weak real effect and with a borderline
+full-sample result.
 
 ## Timing
 

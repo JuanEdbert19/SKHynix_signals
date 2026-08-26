@@ -9,6 +9,7 @@ import sys
 from pathlib import Path
 
 import altair as alt
+import numpy as np
 import pandas as pd
 import streamlit as st
 
@@ -240,6 +241,125 @@ with tab_signal:
             "Check whether the fitted line is carried by the bulk of the sample or by a "
             "handful of extreme days at the edges."
         )
+
+    st.divider()
+
+    # --- tail (outlier) test -------------------------------------------------
+
+    st.subheader("Tail test — do outlier days behave differently?")
+    st.caption(
+        "Rank IC, the HAC fit and the quantile spread all measure a relationship "
+        "across the whole distribution, so an effect confined to spikes is diluted "
+        "by the ordinary days around it. This asks a narrower question: over the "
+        f"{horizon}-day window after a day above the threshold, is the mean return "
+        "different from every other day?"
+    )
+
+    tl = pnl[["signal", fwd_col]].dropna().reset_index()
+    tl.columns = ["date", "signal", "fwd"]
+
+    # The cut is in signal units, so its usable range depends entirely on the
+    # transform: dow_zscore spans roughly -6..+20, while raw naver spans 4..84.
+    # A fixed 1.0-4.0 range put every raw day in the tail, leaving no comparison
+    # group and an unexplained NaN. Bounds therefore come from the data.
+    lo = float(tl["signal"].quantile(0.50))
+    hi = float(tl["signal"].quantile(0.999))
+    default = stats.TAIL_Z if lo < stats.TAIL_Z < hi else float(
+        tl["signal"].quantile(0.90))
+    step = max(round((hi - lo) / 40, 4), 1e-4)
+    tail_z = st.slider("Outlier threshold (signal units)", lo, hi, default, step,
+                       help="Days above this count as outliers. The range follows "
+                            "the selected transform, so it is comparable only "
+                            "within one transform.")
+
+    tail = stats.tail_test(tl["signal"], tl["fwd"], maxlags=horizon,
+                           threshold=tail_z)
+    tl["outlier"] = tl["signal"] > tail_z
+    marks = tl[tl["outlier"]].assign(
+        direction=lambda f: np.where(f["fwd"] >= 0, "up", "down"))
+
+    if not np.isfinite(tail["excess"]):
+        st.warning(
+            f"No usable split at this threshold — {tail['n_tail']:,} tail days and "
+            f"{tail['n_rest']:,} others. The test needs at least 20 days on the tail "
+            "side and at least one on the other, so move the slider.",
+            icon="⚠️",
+        )
+
+    tc = st.columns(4)
+    tc[0].metric(f"Excess return (>{tail_z:g})", f"{tail['excess']:+.4f}",
+                 help="Mean forward return on tail days minus mean on all other "
+                      "days, from a HAC dummy regression on the full sample.")
+    tc[1].metric("HAC t-stat", f"{tail['t']:+.2f}")
+    tc[2].metric("p (HAC)", f"{tail['p']:.4f}",
+                 delta="significant" if tail["p"] < stats.ALPHA
+                       else "not significant",
+                 delta_color="normal" if tail["p"] < stats.ALPHA else "off")
+    tc[3].metric("Tail days", f"{tail['n_tail']:,}",
+                 help=f"{tail['n_tail'] / max(len(tl), 1):.1%} of the {len(tl):,} "
+                      "usable days. The rest form the comparison group.")
+
+    sig_line = alt.Chart(tl).mark_line(color=MUTED, strokeWidth=0.7,
+                                       opacity=0.7).encode(
+        x=alt.X("date:T", title=None),
+        y=alt.Y("signal:Q", title=f"Signal ({tkind})"),
+    )
+    cut = alt.Chart(pd.DataFrame({"y": [tail_z]})).mark_rule(
+        color=INK, strokeDash=[4, 3], strokeWidth=1).encode(y="y:Q")
+    pts = alt.Chart(marks).mark_point(size=45, filled=True, opacity=0.85).encode(
+        x="date:T", y="signal:Q",
+        color=alt.Color("direction:N", title=None,
+                        scale=alt.Scale(domain=["up", "down"],
+                                        range=["#3d9970", "#d1495b"]),
+                        legend=alt.Legend(orient="top")),
+        tooltip=[alt.Tooltip("date:T", title="Date"),
+                 alt.Tooltip("signal:Q", title="Signal", format=".2f"),
+                 alt.Tooltip("fwd:Q", title=f"Forward {horizon}d", format=".2%")],
+    )
+    st.altair_chart(
+        styled((sig_line + cut + pts).properties(
+            title=f"Signal over time — {len(marks):,} days above {tail_z:g}, "
+                  "coloured by the return that followed"), height=260),
+        width="stretch",
+    )
+    if len(marks):
+        up = (marks["direction"] == "up").mean()
+        st.caption(
+            f"**{up:.0%} of tail days were followed by a gain** over {horizon} days "
+            f"(vs {(tl['fwd'] >= 0).mean():.0%} across all days). Mixed colours mean "
+            "the spikes carry no directional information; a one-sided cluster means "
+            "they do."
+        )
+
+    st.markdown("**Threshold sensitivity**")
+    # Same scale problem as the slider: the registered grid is in z units, so it
+    # is used only when it actually lands inside this signal's range.
+    grid = stats.TAIL_GRID
+    if not (lo < min(grid) and max(grid) < hi):
+        grid = tuple(round(float(tl["signal"].quantile(q)), 3)
+                     for q in (0.50, 0.70, 0.80, 0.90, 0.95, 0.98))
+        st.caption(f"Grid taken from this signal's own percentiles — the standard "
+                   f"{min(stats.TAIL_GRID):g}–{max(stats.TAIL_GRID):g} grid is in "
+                   "z units and does not fit the selected transform.")
+    curve = stats.tail_curve(tl["signal"], tl["fwd"], maxlags=horizon,
+                             thresholds=grid)
+    st.dataframe(
+        curve.rename(columns={"threshold": "cut", "excess": "excess return",
+                              "t": "HAC t", "p": "HAC p",
+                              "n_tail": "tail days", "n_rest": "other days"})
+        .style.format({"cut": "{:g}", "excess return": "{:+.4f}", "HAC t": "{:+.2f}",
+                       "HAC p": "{:.4f}", "tail days": "{:,.0f}",
+                       "other days": "{:,.0f}"}),
+        width="stretch", hide_index=True,
+    )
+    st.caption(
+        f"⚠️ **The default cut of {stats.TAIL_Z:g} was chosen after inspecting results, "
+        "so its p-value overstates the evidence** — a Bonferroni threshold across the "
+        "16 combinations examined would be 0.0031. Read the column above as a whole: "
+        "a result holding across neighbouring cuts is worth more than a lone "
+        "significant row, and either way this is exploratory until tested on data "
+        "the threshold was not chosen on."
+    )
 
     st.divider()
 
