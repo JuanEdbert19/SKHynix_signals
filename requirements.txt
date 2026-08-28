@@ -6,5 +6,11 @@ streamlit
 altair
 pyarrow
 openpyxl
+# Only quant/sentiment.py needs these, and only when scoring uncached headlines.
+# Heavy (~2.5GB with the FinBERT weights), but keeping the scorer inside the
+# package is what makes a reported sentiment statistic reproducible by running
+# something in this repo rather than a notebook beside it.
+transformers
+torch
 pytest
 yfinance

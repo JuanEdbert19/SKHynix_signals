@@ -59,6 +59,8 @@ all reduce to one number per trading day, which is the only interface it require
 | `quant/prices.py` | OHLCV for `000660` (pykrx), KOSPI and any yfinance symbol; plus `rebase` |
 | `quant/wiki.py` | Wikipedia pageviews per UTC calendar day |
 | `quant/naver.py` | Naver search trends per KST calendar day, read from hand-exported `.xlsx` |
+| `quant/gdelt.py` | News headlines from GDELT DOC 2.0 — adaptive windowing, resumable per month |
+| `quant/sentiment.py` | FinBERT headline scoring, `P(pos) − P(neg)`, cached by headline hash |
 | `quant/align.py` | UTC **and KST** signal timestamps → KRX trading date. **The only module with timezone logic** |
 | `quant/panel.py` | Forward-return targets and signal transforms |
 | `quant/signals.py` | Signal registry + the three validation fixtures |
@@ -117,6 +119,26 @@ Naming one primary per family in advance is what keeps "one fixed specification 
 test" true with eight real signals registered. If more than one is ever quoted as a
 finding, the Bonferroni correction removed alongside the horizon grid has to come back
 with them.
+
+**Sentiment signal (GDELT news, English):**
+
+| Signal | Query | Role |
+|---|---|---|
+| `gdelt_sent_semi` | `HBM memory` | secondary — **sentiment, not attention** |
+
+The first signal measuring whether the news is *good or bad* rather than how much of it
+there is, and the only one registered against **`fwd_exret`** rather than `fwd_ret`: 17% of
+the headlines are market-wide coverage ("Dow Just Lost 1,100 Points"), which correlates with
+the market on both sides and could manufacture a result through beta. The KOSPI-excess
+target differences that out.
+
+An industry query, not a company one — GDELT matches the article *body* but returns only the
+*title*, so `"SK Hynix"` yields 15% on-topic headlines against 58% for `HBM memory`. It
+therefore measures **international semiconductor sentiment**, not SK Hynix sentiment.
+
+**Article timestamps need no stamping function.** GDELT's `seendate` is a full UTC instant,
+so articles go straight into `align.align_to_trading_days` — unlike the pageview and Naver
+sources, which are calendar days needing a closing-edge convention.
 
 **KST day → trading day.** Naver returns one number per **KST** calendar day.
 `align.daily_kst_to_timestamps` stamps each at `(D+1) 00:00 KST` — 8.5h after the 06:30 UTC

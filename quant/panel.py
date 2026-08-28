@@ -89,6 +89,34 @@ def build_panel(px, sig, transform_kind="zscore", window=20, kospi=None,
     return panel
 
 
+def missing_runs(sig, min_len=3):
+    """Stretches of consecutive trading days where a signal has no value.
+
+    Scattered NaNs are ordinary for a sparse source - GDELT news runs about one
+    article a day before 2024, so many single days are genuinely empty. A long
+    *run* is different in kind: it means the source has nothing for a period,
+    and any window spanning it is measuring fewer days than it appears to.
+    Surfaced so a sample period can be chosen around it rather than over it.
+    """
+    missing = sig.isna().to_numpy()
+    idx = sig.index
+    runs, start = [], None
+    for i, gap in enumerate(missing):
+        if gap and start is None:
+            start = i
+        elif not gap and start is not None:
+            runs.append((start, i - 1))
+            start = None
+    if start is not None:
+        runs.append((start, len(missing) - 1))
+
+    rows = [{"from": idx[a], "to": idx[b], "trading_days": b - a + 1,
+             "calendar_days": (idx[b] - idx[a]).days + 1}
+            for a, b in runs if b - a + 1 >= min_len]
+    return pd.DataFrame(rows, columns=["from", "to", "trading_days",
+                                       "calendar_days"])
+
+
 def past_returns(panel, lags=(1, 3)):
     """Trailing cumulative returns, for the reverse-causality check."""
     logc = np.log(panel["close"])

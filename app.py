@@ -105,7 +105,13 @@ LATE_START_DAYS = 15
 # --- controls ---------------------------------------------------------------
 
 st.sidebar.header("Specification")
-sig_name = st.sidebar.selectbox("Signal", sorted(signals.SIGNALS))
+# Explicit default rather than whatever sorts first: gdelt_sent_semi does, and
+# it is the one signal needing a hand-run backfill, so an alphabetical default
+# made opening the page fail on a fresh clone. naver_hynix is the primary.
+_names = sorted(signals.SIGNALS)
+sig_name = st.sidebar.selectbox(
+    "Signal", _names,
+    index=_names.index("naver_hynix") if "naver_hynix" in _names else 0)
 default_t = signals.DEFAULT_TRANSFORM.get(sig_name, "zscore")
 tkind = st.sidebar.selectbox(
     "Transform", panel_mod.TRANSFORMS, index=panel_mod.TRANSFORMS.index(default_t)
@@ -141,7 +147,15 @@ if sig_name == "planted":
 
 horizon = int(horizon)
 px, kospi = get_prices(start, end)
-sig = signals.load_signal(sig_name, px, kospi)
+try:
+    sig = signals.load_signal(sig_name, px, kospi)
+except FileNotFoundError as exc:
+    # Hand-acquired sources (Naver .xlsx, GDELT backfill) are gitignored and
+    # absent on a fresh clone. Their loaders raise with the recovery command;
+    # show that rather than a traceback.
+    st.error(f"**`{sig_name}` has no data yet.**\n\n{exc}", icon="📥")
+    st.info("Pick another signal in the sidebar to carry on in the meantime.")
+    st.stop()
 pnl = panel_mod.build_panel(px, sig, transform_kind=tkind, window=int(window),
                             kospi=kospi, horizon=horizon)
 
@@ -158,6 +172,33 @@ with tab_signal:
         f"target `{target}` · horizon {horizon}d"
     )
 
+    # --- data coverage ------------------------------------------------------
+
+    gaps = panel_mod.missing_runs(pnl["signal_raw"])
+    have = int(pnl["signal_raw"].notna().sum())
+    label = (f"Data coverage — {have:,} of {len(pnl):,} trading days"
+             + (f", {len(gaps)} gap(s) of 3+ days" if len(gaps) else ", no gaps"))
+    with st.expander(label, expanded=bool(len(gaps))):
+        if len(gaps):
+            st.caption(
+                "Stretches where the source has nothing. A window spanning one of "
+                "these measures fewer days than its date range implies, so it is "
+                "worth choosing **Start** and **End** around them."
+            )
+            st.dataframe(
+                gaps.assign(**{"from": gaps["from"].dt.date, "to": gaps["to"].dt.date}),
+                width="stretch", hide_index=True,
+            )
+        miss = len(pnl) - have
+        if miss:
+            st.caption(
+                f"{miss:,} trading days ({miss/len(pnl):.0%}) have no signal value. "
+                "Scattered single days are ordinary for a sparse source — GDELT "
+                "news runs about one article a day before 2024 — and they are left "
+                "as NaN rather than filled, so they drop out of every statistic "
+                "instead of being counted as zero."
+            )
+
     # --- headline ----------------------------------------------------------
 
     c = st.columns(5)
@@ -166,7 +207,7 @@ with tab_signal:
     c[2].metric("p (HAC)", f"{res['p_hac']:.4f}",
                 delta="significant" if res["p_hac"] < stats.ALPHA else "not significant",
                 delta_color="normal" if res["p_hac"] < stats.ALPHA else "off")
-    c[3].metric("Top−bottom spread", f"{res['ls_spread']:+.4f}",
+    c[3].metric("Top−bottom spread", f"{res['ls_spread']:+.2%}",
                 help=f"Extreme buckets only — HAC t = {res['ls_t']:+.2f}, "
                      f"p = {res['ls_p']:.4f}, n = {int(res['ls_n']):,}. "
                      f"This is a different sample from the {int(res['n']):,} "
@@ -287,9 +328,12 @@ with tab_signal:
         )
 
     tc = st.columns(4)
-    tc[0].metric(f"Excess return (>{tail_z:g})", f"{tail['excess']:+.4f}",
-                 help="Mean forward return on tail days minus mean on all other "
-                      "days, from a HAC dummy regression on the full sample.")
+    # No threshold in the label: "(>2.5)" next to a percentage reads as a return
+    # above 2.5%, when 2.5 is a signal-units cut. It belongs in the help text.
+    tc[0].metric("Excess return, event days", f"{tail['excess']:+.2%}",
+                 help=f"Mean forward return on days with signal > {tail_z:g} "
+                      "(signal units, not a return), minus the mean on all other "
+                      "days. HAC dummy regression on the full sample.")
     tc[1].metric("HAC t-stat", f"{tail['t']:+.2f}")
     tc[2].metric("p (HAC)", f"{tail['p']:.4f}",
                  delta="significant" if tail["p"] < stats.ALPHA
@@ -302,16 +346,16 @@ with tab_signal:
     ev = stats.event_metrics(tl["signal"], tl["fwd"], maxlags=horizon,
                              threshold=tail_z)
     ec = st.columns(4)
-    ec[0].metric("Mean return, event days", f"{ev['mean_event']:+.4f}",
+    ec[0].metric("Mean return, event days", f"{ev['mean_event']:+.2%}",
                  help=f"{ev['n_events']:,} days above the threshold.")
-    ec[1].metric("Mean return, other days", f"{ev['mean_rest']:+.4f}",
+    ec[1].metric("Mean return, other days", f"{ev['mean_rest']:+.2%}",
                  help=f"{ev['n_rest']:,} days. The difference between these two is "
                       "the excess return above.")
     ec[2].metric("Hit rate, event days", f"{ev['hit_rate']:.1%}",
                  delta=f"{ev['hit_diff']:+.1%} vs baseline",
                  delta_color="normal" if ev["hit_p"] < stats.ALPHA else "off",
                  help=f"Share of event days beating the median return of "
-                      f"non-event days ({ev['median_rest']:+.4f}). HAC "
+                      f"non-event days ({ev['median_rest']:+.2%}). HAC "
                       f"t = {ev['hit_t']:+.2f}, p = {ev['hit_p']:.4f}.")
     ec[3].metric("Hit rate, other days", f"{ev['base_rate']:.1%}",
                  help="~50% by construction — the baseline is these days' own "
@@ -370,7 +414,7 @@ with tab_signal:
         curve.rename(columns={"threshold": "cut", "excess": "excess return",
                               "t": "HAC t", "p": "HAC p",
                               "n_tail": "tail days", "n_rest": "other days"})
-        .style.format({"cut": "{:g}", "excess return": "{:+.4f}", "HAC t": "{:+.2f}",
+        .style.format({"cut": "{:g}", "excess return": "{:+.2%}", "HAC t": "{:+.2f}",
                        "HAC p": "{:.4f}", "tail days": "{:,.0f}",
                        "other days": "{:,.0f}"}),
         width="stretch", hide_index=True,

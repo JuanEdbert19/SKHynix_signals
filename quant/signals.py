@@ -154,6 +154,40 @@ def naver_samsung(px, kospi=None):
     return _naver_signal(px, "samsung", "naver_samsung")
 
 
+def gdelt_sent_semi(px, kospi=None):
+    """FinBERT sentiment of semiconductor news headlines. SECONDARY.
+
+    The first signal here measuring sentiment rather than attention, and the
+    first whose source carries a real timestamp: GDELT's `seendate` is a full
+    UTC instant, so articles go straight into align_to_trading_days with no
+    daily rounding and no stamping function.
+
+    Query is "HBM memory", not "SK Hynix": GDELT matches the article body but
+    returns only the title, so a company query yields headlines about other
+    companies that mention SK Hynix in passing (15% of titles named it, against
+    58% on-topic for the industry query). What this measures is therefore
+    international semiconductor sentiment, not SK Hynix sentiment.
+
+    Registered against fwd_exret rather than fwd_ret - see CLAUDE.md.
+    """
+    from quant import gdelt, sentiment
+
+    # allow_fetch=False: the backfill is hundreds of rate-limited requests and
+    # belongs to scripts/fetch_gdelt.py. Without this, opening the dashboard
+    # starts one, because this signal sorts first and is the default selection.
+    arts = gdelt.load_articles(GDELT_QUERY, px.index[0], px.index[-1],
+                               allow_fetch=False)
+    if arts.empty:
+        return pd.Series(np.nan, index=px.index, name="gdelt_sent_semi")
+    scored = pd.Series(sentiment.score_headlines(arts["title"]).to_numpy(),
+                       index=pd.DatetimeIndex(arts["seendate"]))
+    return align.align_to_trading_days(
+        scored, px.index, agg=SIGNAL_AGG["gdelt_sent_semi"]
+    ).rename("gdelt_sent_semi")
+
+
+GDELT_QUERY = "HBM memory"
+
 SIGNALS = {
     "noise": noise,
     "planted": planted,
@@ -166,6 +200,7 @@ SIGNALS = {
     "naver_hbm": naver_hbm,
     "naver_memory": naver_memory,
     "naver_samsung": naver_samsung,
+    "gdelt_sent_semi": gdelt_sent_semi,
 }
 
 # Counts are aggregated by sum when aligned; level-like signals by mean.
@@ -182,7 +217,11 @@ SIGNALS = {
 SIGNAL_AGG = {"noise": "mean", "planted": "mean", "past_return": "mean",
               "wiki_hynix": "mean", "wiki_semi": "mean", "wiki_hbm": "mean",
               "naver_hynix": "mean", "naver_semi": "mean", "naver_hbm": "mean",
-              "naver_memory": "mean", "naver_samsung": "mean"}
+              "naver_memory": "mean", "naver_samsung": "mean",
+              # Sentiment is a mean of scores, not a count, so Monday's
+              # three-day bucket is not mechanically biased the way the
+              # attention signals are. Measured before choosing below.
+              "gdelt_sent_semi": "mean"}
 
 # The three fixtures are already stationary, so their natural transform is the
 # identity. Count-style signals (tweet volume, search volume) should default to
@@ -198,7 +237,14 @@ DEFAULT_TRANSFORM = {"noise": "raw", "planted": "raw", "past_return": "raw",
                      "wiki_hbm": "dow_zscore",
                      "naver_hynix": "dow_zscore", "naver_semi": "dow_zscore",
                      "naver_hbm": "dow_zscore", "naver_memory": "dow_zscore",
-                     "naver_samsung": "dow_zscore"}
+                     "naver_samsung": "dow_zscore",
+                     # PROVISIONAL - the weekday diagnostic has not been run yet
+                     # (no data fetched). Sentiment is a mean of bounded scores
+                     # rather than an accumulated count, so Monday's three-day
+                     # bucket should not be mechanically biased the way the
+                     # attention signals are; "raw" follows from that reasoning,
+                     # not from a measurement. Re-check before quoting a result.
+                     "gdelt_sent_semi": "raw"}
 
 
 def load_signal(name, px, kospi=None, **kwargs):

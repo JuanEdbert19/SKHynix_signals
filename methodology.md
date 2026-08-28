@@ -161,6 +161,57 @@ survive halving the sample — ≤2024 gives +0.72% (p = 0.092), 2025–26 gives
 (p = 0.187) — which is equally consistent with a weak real effect and with a borderline
 full-sample result.
 
+## News sentiment
+
+**FinBERT was chosen by measurement, not by reputation.** On 84 real GDELT semiconductor
+headlines:
+
+| Model | pos / neutral / neg | Mean confidence |
+|---|---|---|
+| `ProsusAI/finbert` | 43 / 35 / 23 | **0.824** |
+| `cardiffnlp/twitter-roberta-base-sentiment-latest` | 32 / **52** / 16 | 0.701 |
+| `yiyanghkust/finbert-tone` | fails to load — no `model_type` in `config.json` | — |
+
+The two working models disagree on **40%** of headlines, and FinBERT is right on the
+financially loaded ones: *"CXMT Could Threaten Samsung and SK Hynix"* reads negative to it
+and neutral to twitter-roberta; *"AMD Stock Jumps as Earnings Reignite AI Chip Trade"* reads
+positive vs neutral. Twitter-roberta has no weight for *threaten*, *reignite* or *crisis*, so
+it defaults to neutral — and its 52% neutral share is a direct loss of signal variance.
+
+Used zero-shot. FinBERT was further-pretrained on Reuters TRC2 and fine-tuned on Financial
+PhraseBank, both financial *news sentences* — the same register as a headline — so a
+fine-tune has no obvious domain gap to close. `yiyanghkust/finbert-tone`, trained on analyst
+reports, is the genuinely formal one and is the wrong fit here even before it fails to load.
+
+**Score is `P(pos) − P(neg)`, not the argmax label.** A headline the model calls positive at
+0.51 should not count the same as one it calls positive at 0.99, and a neutral headline lands
+near 0 rather than being discarded.
+
+**Headlines are all GDELT provides**, and the query is an industry one for that reason.
+GDELT matches the article *body* but returns only the *title*, so `"SK Hynix"` yields
+headlines about other companies that mention it in passing — **15%** of titles named the
+company, against **58%** on-topic for `HBM memory`. Scraping article bodies would not fix
+this: an article about Amazon that mentions SK Hynix once is still about Amazon. The unit
+that would fix it is entity-level sentiment, which is a different pipeline.
+
+**Target is `fwd_exret`, the only signal for which that is true.** 17% of headlines are
+market-wide coverage — *"Dow Just Lost 1,100 Points"*, *"Chip Stocks Lose $1 Trillion"*.
+That contamination correlates with the market, and so does SK Hynix, so on `fwd_ret` it could
+produce a relationship through beta rather than information. The KOSPI-excess target
+differences it out of both sides.
+
+**Coverage grows ~8× across the sample and the early years are thin** — 1.0 articles/day in
+June 2019, 2.0 in 2021, 8.3+/day in 2026. The consequence is measurement error in the
+regressor on sparse days, which attenuates the pooled coefficient. Simulated at a realistic
+noise level: reliability 0.74 at one headline/day against 0.96 at eight, shrinking a
+standardized coefficient about **14%** — while the extra ~900 days *raise* the t-statistic
+(+12.71 pooled vs +10.11 on the clean half alone). So the full 2019–2026 sample is kept: the
+noise costs precision, the sample size more than repays it, and narrowing to 2023+ is a
+sidebar setting rather than a fetch decision.
+
+Days with **zero** articles are NaN, not zero. An absent headline is an undefined sentiment,
+not a neutral one.
+
 ## Timing
 
 **A one-day lag is correct for a research claim; a tradeable claim needs more.**

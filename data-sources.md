@@ -587,7 +587,37 @@ sparse for a daily signal but work as a free event detector.
 Signals are distinct, not redundant — correlation of daily log-changes: `ko:SK하이닉스` vs
 `ko:반도체` = **0.30**, vs `ko:삼성전자` = **0.42**.
 
-**GDELT DOC 2.0** — daily granularity confirmed at *both* ends of the price sample:
+**GDELT DOC 2.0 — ADOPTED 2026-08-26** as the source for `gdelt_sent_semi`, the project's
+first sentiment signal. What it returns, measured rather than assumed:
+
+- **Headlines only.** Fields are `url, url_mobile, title, seendate, socialimage, domain,
+  language, sourcecountry`. No article body, no summary, and no parameter that returns one.
+  `seendate` is a full UTC instant, which is why this signal needs no stamping function.
+- **The query must be an industry one.** GDELT matches the article *body* and returns the
+  *title*, so a company query hands back headlines about other companies:
+
+  | Query | On-topic titles | Market-wide | Unrelated | Languages |
+  |---|---|---|---|---|
+  | `"SK Hynix"` | **15%** | — | — | 64% Korean |
+  | `HBM memory` | **58%** | 17% | 25% | 100% English |
+
+- **Earlier concern corrected.** This document previously warned that GDELT would measure
+  "Anglophone coverage of a Korean company", on the basis that only 830 of 189,545 monitored
+  outlets are South Korean. For a *company* query that is wrong — the results came back 64%
+  Korean, led by `newspim.com`, `fnnews.com`, `munhwa.com`. A small share of the source list
+  does not imply a small share of results. The English-only outcome above is a property of
+  the English-phrased industry query, not of GDELT's coverage.
+- **Coverage grows ~8× over the sample**: 1.0 articles/day (June 2019), 2.0 (2021), 8.3+/day
+  (2026, capped at the 250 record limit). Recorded because it is a real limitation of any
+  signal built on it — see `methodology.md`.
+- **Rate limit is 1 request / 5 seconds, enforced by IP block**, and the refusal arrives as
+  *plain text with a 200 status*. Anything that treats a non-empty response as success will
+  cache an error string as data. `quant/gdelt.py` detects it explicitly.
+- **`maxrecords` caps at 250** and returns the newest first, so a fixed date window silently
+  drops the oldest articles in busy periods. The fetcher halves its window whenever a page
+  comes back full.
+
+Earlier probe, retained: daily granularity confirmed at *both* ends of the price sample:
 91 daily points for 2019-01-01→2019-04-01, 89 for 2026-05-01→2026-08-01. Mean intensity for
 `"SK Hynix"` was **0.0101 in Q1 2019 vs 0.1042 in mid-2026**, a ~10× rise that is either the
 HBM/AI cycle or an expansion of GDELT's source list — **indistinguishable without a control

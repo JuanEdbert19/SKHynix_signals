@@ -923,3 +923,297 @@ def test_evaluate_exposes_the_event_metrics():
               "ev_base_rate", "ev_hit_p", "ev_abs_ratio"):
         assert k in res, f"evaluate dropped {k}"
     assert res["ev_n_events"] + res["ev_n_rest"] == res["n"]
+
+
+# --- GDELT fetcher and headline sentiment ------------------------------------
+
+
+def _articles(n, start="2024-06-01T00:00:00Z"):
+    """n fake GDELT article dicts with the real field names."""
+    t0 = pd.Timestamp(start)
+    # url must be unique across calls: load_articles dedupes on it, so a helper
+    # reusing urls would silently drop every month after the first.
+    return [{"url": f"http://x/{t0:%Y%m%d}/{i}", "url_mobile": "",
+             "title": f"headline {i}",
+             "seendate": (t0 + pd.to_timedelta(i, unit="m")).strftime("%Y%m%dT%H%M%SZ"),
+             "socialimage": "", "domain": "x.com", "language": "English",
+             "sourcecountry": "US"} for i in range(n)]
+
+
+def test_full_page_splits_the_window(monkeypatch):
+    """The fetcher's core correctness property.
+
+    GDELT caps at 250 and returns the NEWEST first, so a full page means the
+    oldest articles in that window were silently dropped. Not splitting would
+    left-censor every chunk, which looks like low news volume rather than a bug.
+    """
+    from quant import gdelt
+
+    calls = []
+
+    def fake_get(query, start, end):
+        calls.append((start, end))
+        # full page only for the first (widest) request
+        return _articles(gdelt.MAXRECORDS if len(calls) == 1 else 3)
+
+    monkeypatch.setattr(gdelt, "_get", fake_get)
+    out = []
+    gdelt._walk("q", pd.Timestamp("2024-06-01"), pd.Timestamp("2024-07-01"), out)
+
+    assert len(calls) == 3, f"expected split into 2 halves, got {len(calls)} calls"
+    assert calls[1][1] == calls[2][0], "halves must meet at the midpoint"
+    assert len(out) == 6
+
+
+def test_partial_page_does_not_split(monkeypatch):
+    from quant import gdelt
+
+    calls = []
+
+    def fake_get(query, start, end):
+        calls.append((start, end))
+        return _articles(10)
+
+    monkeypatch.setattr(gdelt, "_get", fake_get)
+    out = []
+    gdelt._walk("q", pd.Timestamp("2024-06-01"), pd.Timestamp("2024-07-01"), out)
+    assert len(calls) == 1 and len(out) == 10
+
+
+def test_splitting_stops_at_the_floor(monkeypatch):
+    """A single day busier than the cap cannot be fixed by halving.
+
+    It must terminate and warn rather than recurse forever.
+    """
+    from quant import gdelt
+
+    monkeypatch.setattr(gdelt, "_get",
+                        lambda q, s, e: _articles(gdelt.MAXRECORDS))
+    out = []
+    gdelt._walk("q", pd.Timestamp("2024-06-01"), pd.Timestamp("2024-06-02"), out)
+    assert len(out) > 0
+
+
+def test_rate_limit_body_is_not_parsed_as_data(monkeypatch):
+    """GDELT refuses with plain text and a 200 status.
+
+    Treating a non-empty response as success caches an error string as if it
+    were articles - the exact mistake that lost a measurement while planning.
+    """
+    import io
+
+    from quant import gdelt
+
+    monkeypatch.setattr(gdelt.time, "sleep", lambda _: None)
+    monkeypatch.setattr(gdelt.urllib.request, "urlopen",
+                        lambda *a, **k: io.BytesIO(
+                            gdelt.LIMIT_MARK.encode() + b" to one every 5 seconds"))
+    assert gdelt._get("q", pd.Timestamp("2024-06-01"), pd.Timestamp("2024-07-01")) is None
+
+
+def test_unreachable_gdelt_raises_rather_than_caching_nothing(monkeypatch):
+    from quant import gdelt
+
+    monkeypatch.setattr(gdelt, "_get", lambda *a: None)
+    with pytest.raises(RuntimeError, match="unreachable"):
+        gdelt._walk("q", pd.Timestamp("2024-06-01"), pd.Timestamp("2024-07-01"), [])
+
+
+def test_month_cache_is_not_refetched(monkeypatch, tmp_path):
+    from quant import gdelt
+
+    monkeypatch.setattr(gdelt, "CACHE_DIR", tmp_path)
+    calls = []
+
+    def fake_walk(query, start, end, out):
+        calls.append(start)
+        out.extend(_articles(5, start=f"{start:%Y-%m-%d}T00:00:00Z"))
+
+    monkeypatch.setattr(gdelt, "_walk", fake_walk)
+    a = gdelt.load_articles("q", "2024-06-01", "2024-07-01")
+    assert len(calls) == 1 and len(a) == 5
+
+    b = gdelt.load_articles("q", "2024-06-01", "2024-07-01")
+    assert len(calls) == 1, "second call refetched a cached month"
+    assert len(b) == 5
+
+
+@pytest.mark.parametrize("raw,want", [
+    ("Micron , SK hynix , Oracle", "Micron, SK hynix, Oracle"),
+    ("12 . 8 Gbps , Inching Closer", "12.8 Gbps, Inching Closer"),
+    ("Apple Is Facing A Shift ; Memory", "Apple Is Facing A Shift; Memory"),
+    ("clean headline", "clean headline"),
+])
+def test_gdelt_punctuation_spacing_is_undone(raw, want):
+    """GDELT pre-tokenises titles; FinBERT was not trained on that spacing."""
+    from quant import sentiment
+
+    assert sentiment.clean_headline(raw) == want
+
+
+@pytest.mark.slow
+def test_finbert_reads_obvious_financial_headlines(tmp_path, monkeypatch):
+    """Loads the real model. Signs must be right or the pipeline is wrong."""
+    from quant import sentiment
+
+    monkeypatch.setattr(sentiment, "CACHE", tmp_path / "s.parquet")
+    monkeypatch.setattr(sentiment, "CACHE_DIR", tmp_path)
+    s = sentiment.score_headlines(pd.Series([
+        "Memory prices surge as DRAM demand beats expectations",
+        "Chipmaker plunges after slashing guidance on weak demand",
+    ]))
+    assert s.iloc[0] > 0.2, s.tolist()
+    assert s.iloc[1] < -0.2, s.tolist()
+
+
+def test_signal_never_triggers_a_backfill(monkeypatch, tmp_path):
+    """Opening the dashboard must not start an hour of rate-limited fetching.
+
+    gdelt_sent_semi sorts first in SIGNALS, so it is the app's default
+    selection. With allow_fetch defaulting to True a page load would kick off
+    the whole backfill; the signal must read the cache and say what to run.
+    """
+    from quant import gdelt
+
+    monkeypatch.setattr(gdelt, "CACHE_DIR", tmp_path)
+    monkeypatch.setattr(gdelt, "_walk",
+                        lambda *a: pytest.fail("signal attempted a network fetch"))
+    with pytest.raises(FileNotFoundError, match="fetch_gdelt"):
+        gdelt.load_articles("q", "2024-06-01", "2024-07-01", allow_fetch=False)
+
+
+def test_one_unreachable_month_does_not_abort_the_backfill(monkeypatch, tmp_path, capsys):
+    """A 91-month backfill must survive a throttled month.
+
+    Nothing is written for the failure, so a re-run retries it, and the skip is
+    printed rather than swallowed. The analysis path refuses missing months
+    separately, so a gap cannot reach a regression as "no news".
+    """
+    from quant import gdelt
+
+    monkeypatch.setattr(gdelt, "CACHE_DIR", tmp_path)
+
+    def flaky(query, start, end, out):
+        if start.month == 2:
+            raise RuntimeError("GDELT unreachable")
+        out.extend(_articles(4, start=f"{start:%Y-%m-%d}T00:00:00Z"))
+
+    monkeypatch.setattr(gdelt, "_walk", flaky)
+    got = gdelt.load_articles("q", "2024-01-01", "2024-04-01")
+
+    assert len(got) == 8, "January and March should still be present"
+    assert not (tmp_path / "gdelt" / "q_202402.parquet").exists(), \
+        "a failed month must not be cached, or a re-run would skip it"
+    assert "2024-02" in capsys.readouterr().out
+
+
+def test_dashboard_default_signal_needs_no_hand_fetched_data():
+    """A fresh clone must be able to open the app.
+
+    gdelt_sent_semi sorts first and needs a hand-run backfill, so an
+    alphabetical default meant opening the page raised FileNotFoundError.
+    The default is the declared primary instead.
+    """
+    src = (ROOT / "app.py").read_text()
+    assert 'index=_names.index("naver_hynix")' in src, \
+        "app.py no longer pins an explicit default signal"
+    assert sorted(signals.SIGNALS)[0] == "gdelt_sent_semi", \
+        "the alphabetical-first signal changed; re-check the default is still safe"
+
+
+def test_missing_runs_finds_gaps_but_ignores_scattered_nans():
+    """Scattered NaNs are ordinary for a sparse source; a run is a source gap.
+
+    Only the run should be reported, or the coverage panel becomes noise on
+    exactly the signals that need it most.
+    """
+    idx = pd.bdate_range("2024-01-01", periods=40, name="date")
+    s = pd.Series(1.0, index=idx)
+    s.iloc[3] = np.nan                 # isolated
+    s.iloc[10] = np.nan                # isolated
+    s.iloc[20:28] = np.nan             # an 8-day run
+
+    runs = panel.missing_runs(s, min_len=3)
+    assert len(runs) == 1, runs
+    assert runs.iloc[0]["trading_days"] == 8
+    assert runs.iloc[0]["from"] == idx[20] and runs.iloc[0]["to"] == idx[27]
+
+
+def test_missing_runs_handles_a_gap_at_the_end():
+    idx = pd.bdate_range("2024-01-01", periods=10, name="date")
+    s = pd.Series(1.0, index=idx)
+    s.iloc[7:] = np.nan
+    runs = panel.missing_runs(s, min_len=3)
+    assert len(runs) == 1 and runs.iloc[0]["to"] == idx[-1]
+
+
+def test_missing_runs_is_empty_for_a_complete_signal():
+    idx = pd.bdate_range("2024-01-01", periods=20, name="date")
+    assert panel.missing_runs(pd.Series(1.0, index=idx)).empty
+
+
+def test_score_cache_round_trips(tmp_path, monkeypatch):
+    """Scoring twice must hit the cache, not raise.
+
+    The first write named the value column `0` instead of `score`, because
+    pd.concat drops a Series name when the other operand is unnamed. Writing
+    succeeded and the read-back raised KeyError('score') - invisible to any
+    test that only calls score_headlines once.
+    """
+    from quant import sentiment
+
+    monkeypatch.setattr(sentiment, "CACHE", tmp_path / "s.parquet")
+    monkeypatch.setattr(sentiment, "CACHE_DIR", tmp_path)
+
+    calls = []
+
+    class FakePipe:
+        def __call__(self, texts):
+            calls.append(len(texts))
+            return [[{"label": "positive", "score": 0.8},
+                     {"label": "negative", "score": 0.1},
+                     {"label": "neutral", "score": 0.1}] for _ in texts]
+
+    monkeypatch.setattr(sentiment, "_pipeline", lambda: FakePipe())
+
+    titles = pd.Series(["Memory prices surge", "Chipmaker cuts guidance"])
+    first = sentiment.score_headlines(titles)
+    assert first.tolist() == pytest.approx([0.7, 0.7])
+    assert sum(calls) == 2, "first call should score both headlines"
+
+    # The line that used to raise.
+    second = sentiment.score_headlines(titles)
+    assert second.tolist() == pytest.approx([0.7, 0.7])
+    assert sum(calls) == 2, "second call re-scored instead of hitting the cache"
+
+    stored = pd.read_parquet(tmp_path / "s.parquet")
+    assert list(stored.columns) == ["key", "score"], stored.columns.tolist()
+
+
+def test_unusable_sentiment_cache_rebuilds_instead_of_crashing(tmp_path, monkeypatch,
+                                                               capsys):
+    """A cache is an optimisation; a broken one must cost time, not break.
+
+    The first release wrote the value column as `0`, and the read raised
+    KeyError deep inside the signal - which reached the user as a dashboard
+    traceback with no indication that deleting one file would fix it.
+    """
+    from quant import sentiment
+
+    cache = tmp_path / "s.parquet"
+    pd.DataFrame({"key": ["abc"], "0": [0.5]}).to_parquet(cache, index=False)
+    monkeypatch.setattr(sentiment, "CACHE", cache)
+    monkeypatch.setattr(sentiment, "CACHE_DIR", tmp_path)
+
+    class FakePipe:
+        def __call__(self, texts):
+            return [[{"label": "positive", "score": 0.9},
+                     {"label": "negative", "score": 0.05},
+                     {"label": "neutral", "score": 0.05}] for _ in texts]
+
+    monkeypatch.setattr(sentiment, "_pipeline", lambda: FakePipe())
+
+    out = sentiment.score_headlines(pd.Series(["Memory prices surge"]))
+    assert out.iloc[0] == pytest.approx(0.85)
+    assert "unusable" in capsys.readouterr().out
+    assert list(pd.read_parquet(cache).columns) == ["key", "score"]
