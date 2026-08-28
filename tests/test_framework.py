@@ -1217,3 +1217,25 @@ def test_unusable_sentiment_cache_rebuilds_instead_of_crashing(tmp_path, monkeyp
     assert out.iloc[0] == pytest.approx(0.85)
     assert "unusable" in capsys.readouterr().out
     assert list(pd.read_parquet(cache).columns) == ["key", "score"]
+
+
+def test_coverage_reports_the_signals_real_span():
+    """A window set wider than the data just yields NaN and says nothing.
+
+    coverage() is what tells the reader the requested period and the period
+    with data are different.
+    """
+    idx = pd.bdate_range("2024-01-01", periods=30, name="date")
+    s = pd.Series(np.nan, index=idx)
+    s.iloc[10:20] = 1.0                       # data only in the middle
+
+    cov = panel.coverage(s)
+    assert cov["first"] == idx[10]
+    assert cov["last"] == idx[19]
+    assert cov["n_have"] == 10 and cov["n_total"] == 30
+
+
+def test_coverage_handles_a_signal_with_no_data():
+    idx = pd.bdate_range("2024-01-01", periods=10, name="date")
+    cov = panel.coverage(pd.Series(np.nan, index=idx))
+    assert cov["first"] is None and cov["last"] is None and cov["n_have"] == 0

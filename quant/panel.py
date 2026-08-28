@@ -89,6 +89,24 @@ def build_panel(px, sig, transform_kind="zscore", window=20, kospi=None,
     return panel
 
 
+def coverage(sig, min_gap=3):
+    """Where a signal actually has data, and where it does not.
+
+    `first`/`last` are the real extent of the source, which can be much narrower
+    than the requested window - a sample period set wider than the data just
+    produces NaN, and nothing else in the output says so.
+    """
+    have = sig.notna()
+    return {
+        "first": sig.index[have.argmax()] if have.any() else None,
+        "last": sig.index[len(have) - 1 - have.to_numpy()[::-1].argmax()]
+                if have.any() else None,
+        "n_have": int(have.sum()),
+        "n_total": len(sig),
+        "gaps": missing_runs(sig, min_len=min_gap),
+    }
+
+
 def missing_runs(sig, min_len=3):
     """Stretches of consecutive trading days where a signal has no value.
 

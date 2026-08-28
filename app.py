@@ -120,15 +120,26 @@ window = st.sidebar.number_input("Z-score baseline window (days)", 5, 250, 20)
 target = st.sidebar.selectbox(
     "Target", list(TARGET_LABEL), format_func=TARGET_LABEL.__getitem__
 )
-horizon = st.sidebar.number_input("Forward horizon (days)", 1, 20,
-                                  panel_mod.HORIZON)
-start = st.sidebar.text_input("Start", "2019-01-01")
+# Dashboard defaults, set by the developer on 2026-08-29. These are NOT the
+# pre-registered specification: panel_mod.HORIZON is 3 and the recorded sample
+# starts 2019-01-01, which is what run_test.py and findings.md still use. The
+# two are deliberately allowed to differ so browsing does not overwrite the
+# record, but a number read off this page is not comparable to findings.md
+# unless the horizon and start are put back.
+DEFAULT_HORIZON = 1
+DEFAULT_START = "2023-01-01"
+
+horizon = st.sidebar.number_input("Forward horizon (days)", 1, 20, DEFAULT_HORIZON)
+start = st.sidebar.text_input("Start", DEFAULT_START)
 end = st.sidebar.text_input("End", "2026-08-06")
 quantiles = st.sidebar.slider("Quantile buckets", 3, 10, 5)
 
 st.sidebar.caption(
     "Primary specification for this project is **zscore / forward return (raw) / "
-    "h=3**, fixed in advance. Anything else is an explicitly secondary test."
+    "h=3 / from 2019-01-01**, fixed in advance — that is what `findings.md` and "
+    f"`run_test.py` report. This page now defaults to **h={DEFAULT_HORIZON} / from "
+    f"{DEFAULT_START}** for convenience, so anything read off it is an explicitly "
+    "secondary result until the horizon and start are set back."
 )
 st.sidebar.caption(
     "Signal, Transform, Window, Target, Horizon and Quantiles affect the **Signal "
@@ -174,11 +185,28 @@ with tab_signal:
 
     # --- data coverage ------------------------------------------------------
 
-    gaps = panel_mod.missing_runs(pnl["signal_raw"])
-    have = int(pnl["signal_raw"].notna().sum())
-    label = (f"Data coverage — {have:,} of {len(pnl):,} trading days"
-             + (f", {len(gaps)} gap(s) of 3+ days" if len(gaps) else ", no gaps"))
+    cov = panel_mod.coverage(pnl["signal_raw"])
+    gaps, have = cov["gaps"], cov["n_have"]
+    span = (f"{cov['first']:%Y-%m-%d} → {cov['last']:%Y-%m-%d}"
+            if cov["first"] is not None else "no data in this window")
+    label = (f"Data coverage — `{sig_name}` spans {span} · {have:,} of "
+             f"{len(pnl):,} trading days"
+             + (f" · {len(gaps)} gap(s)" if len(gaps) else " · no gaps"))
     with st.expander(label, expanded=bool(len(gaps))):
+        if cov["first"] is not None:
+            asked = f"{pnl.index[0]:%Y-%m-%d} → {pnl.index[-1]:%Y-%m-%d}"
+            st.caption(f"Requested window **{asked}** · signal has data "
+                       f"**{span}**.")
+            short_start = (cov["first"] - pnl.index[0]).days
+            short_end = (pnl.index[-1] - cov["last"]).days
+            if short_start > 30 or short_end > 30:
+                st.warning(
+                    f"The signal starts {short_start} day(s) after the window opens "
+                    f"and ends {short_end} day(s) before it closes. Those stretches "
+                    "contribute nothing — narrow Start/End to match if you want the "
+                    "sample size to mean what it says.",
+                    icon="📐",
+                )
         if len(gaps):
             st.caption(
                 "Stretches where the source has nothing. A window spanning one of "
