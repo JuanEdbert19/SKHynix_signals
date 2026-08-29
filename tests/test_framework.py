@@ -1115,8 +1115,8 @@ def test_dashboard_default_signal_needs_no_hand_fetched_data():
     The default is the declared primary instead.
     """
     src = (ROOT / "app.py").read_text()
-    assert 'index=_names.index("naver_hynix")' in src, \
-        "app.py no longer pins an explicit default signal"
+    assert '_pick("Signal", "naver_hynix"' in src, \
+        "the single-signal picker no longer defaults to naver_hynix"
     assert sorted(signals.SIGNALS)[0] == "gdelt_sent_semi", \
         "the alphabetical-first signal changed; re-check the default is still safe"
 
@@ -1339,3 +1339,44 @@ def test_signal_correlation_uses_the_intersection():
     assert r["n_a"] == 100 and r["n_b"] == 40
     assert r["pearson"] == pytest.approx(1.0)
     assert stats.signal_correlation(b, a)["n_overlap"] == 40
+
+
+def test_describe_reports_the_shape_of_a_signal():
+    """Kurtosis is the one that matters: dow_zscore reaches the hundreds, which
+    is why rank IC and the HAC t can disagree in sign."""
+    idx = pd.bdate_range("2024-01-01", periods=200, name="date")
+    rng = np.random.default_rng(0)
+    s = pd.Series(rng.standard_normal(200), index=idx)
+    s.iloc[100] = 50.0                       # one extreme day
+
+    d = panel.describe(s)
+    assert d["n"] == 200
+    assert d["max"] == pytest.approx(50.0)
+    assert d["kurtosis"] > 50, "one extreme day should show up as fat tails"
+    assert d["p99"] < d["max"], "the 99th percentile must sit below an isolated outlier"
+
+
+def test_describe_handles_an_empty_signal():
+    idx = pd.bdate_range("2024-01-01", periods=10, name="date")
+    d = panel.describe(pd.Series(np.nan, index=idx))
+    assert d["n"] == 0 and np.isnan(d["sd"])
+
+
+def test_single_and_combined_paths_yield_the_same_panel_shape():
+    """The restructure's premise: one analysis path serves both signal sources.
+
+    If the combined branch produced a differently shaped panel, the Test tab
+    would need its own rendering again - which is the duplication the layout
+    change removed.
+    """
+    px = fake_px()
+    one = signals.SIGNALS["noise"](px, None, seed=0)
+    two = panel.combine(signals.SIGNALS["noise"](px, None, seed=1),
+                        signals.SIGNALS["noise"](px, None, seed=2), window=20)
+
+    a = panel.build_panel(px, one, transform_kind="raw", horizon=3)
+    b = panel.build_panel(px, two, transform_kind="raw", horizon=3)
+    assert list(a.columns) == list(b.columns)
+    assert a.index.equals(b.index)
+    for frame in (a, b):
+        assert {"signal", "signal_raw", "fwd_ret_3"} <= set(frame.columns)

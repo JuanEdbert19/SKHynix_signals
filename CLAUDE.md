@@ -62,36 +62,32 @@ all reduce to one number per trading day, which is the only interface it require
 | `quant/gdelt.py` | News headlines from GDELT DOC 2.0 — adaptive windowing, resumable per month |
 | `quant/sentiment.py` | FinBERT headline scoring, `P(pos) − P(neg)`, cached by headline hash |
 | `quant/align.py` | UTC **and KST** signal timestamps → KRX trading date. **The only module with timezone logic** |
-| `quant/panel.py` | Forward-return targets and signal transforms |
+| `quant/panel.py` | Forward-return targets, signal transforms, coverage and distribution summaries |
 | `quant/signals.py` | Signal registry + the three validation fixtures |
 | `quant/stats.py` | Rank IC, quantile buckets, Newey-West regressions, reverse causality |
 | `scripts/run_test.py` | CLI; writes a JSON record to `results/` |
 | `app.py` | Streamlit dashboard, three tabs — a thin caller of the same functions, so it cannot drift |
 
-**Combining signals.** *Combine* multiplies an attention signal by a sentiment one to test
-whether sentiment matters more when attention is high. Attention enters as
-`panel.trailing_pct_rank` in [0,1] — a weight — and sentiment supplies the sign, because a
-plain product inverts on days when both are negative (8% of the overlap). The rank is
-**trailing**: a full-sample rank would let day *t* depend on later days, which is look-ahead.
+**Dashboard.** Three tabs, each answering one question. *Signal* describes what the thing
+is — coverage and gaps, the series over time, its distribution (sd, skew, kurtosis, extremes)
+and its correlation with any other signal. No forward returns appear there, deliberately: a
+signal should be judged trustworthy before it is judged useful. *Test* is the whole analysis —
+headline metrics, quantiles, scatter, tail test, reverse causality. *Price* is the log-axis
+close chart with overlays.
+
+**Signal construction lives in the sidebar, not in a tab.** The Source toggle picks a single
+registered signal or a *combined* one — an attention signal times a sentiment one, attention
+entering as `panel.trailing_pct_rank` in [0,1] and sentiment supplying the sign, because a
+plain product inverts when both are negative. Either branch produces one `sig`, so there is a
+single analysis path and nothing is rendered twice. This replaced a Combine tab that
+re-implemented a subset of the Test tab's output.
+
 `trailing_pct_rank` is deliberately not in `TRANSFORMS` — `pctrank` was cut on 2026-08-10 and
-re-registering it would reverse that.
+re-registering it would reverse that. The combined pair is not registered in `SIGNALS`;
+`run_test.py --combine A,B` is what keeps a combined result reproducible. See `methodology.md`.
 
-The pair is chosen in the UI, so nothing is registered in `SIGNALS`; `run_test.py --combine
-A,B` is what keeps a combined result reproducible from the repo. See `methodology.md`.
-
-**Dashboard tabs.** *Signal test* is the whole analysis and reproduces `run_test.py`
-exactly. *Price* is a log-axis close chart with a SK Hynix volume panel, and takes any
-number of overlay tickers (`prices.load_quote`, any yfinance symbol, typed or picked).
-With an overlay present every line is `prices.rebase`d to 100 at the window start, so
-the axis reads as percentage growth and a KRW line is comparable to a USD one without
-FX; with none it shows raw KRW. Both live in `quant/prices.py` — `app.py` still
-computes nothing, and anything derived added later belongs in `quant/` too.
-
-**Overlay series are chart-only.** They are reindexed onto the KRX calendar and
-forward-filled, and a US close lands ~13.5h after the Korean close of the same date.
-That is fine for looking at, and disqualifying for a statistic — a peer series used as a
-signal or target must go through `quant/align.py` first, like every other cross-timezone
-series.
+Sidebar groups: **Signal** (source and pickers), **Specification** (transform, target, horizon,
+window, quantiles), **Sample** (start, end).
 
 **Adding a real signal**: write a function `(px, kospi) -> Series` keyed by trading
 date and register it in `SIGNALS`, `SIGNAL_AGG` and `DEFAULT_TRANSFORM`. If it arrives as

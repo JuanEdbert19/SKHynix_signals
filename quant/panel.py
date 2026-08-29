@@ -129,6 +129,33 @@ def combine(attention, sentiment, window=20):
     return (both["w"] * both["s"]).rename("combined")
 
 
+def describe(sig):
+    """Shape of a signal's distribution, before any return is involved.
+
+    Kurtosis earns its place here: dow_zscore has a 4-observation baseline whose
+    standard deviation occasionally collapses, producing values like z = +124.7
+    with kurtosis in the hundreds. That is what makes the HAC t outlier-sensitive
+    while rank IC is not, and a reader should meet it while looking at the signal
+    rather than infer it from a sign-flipping t-statistic. See methodology.md.
+    """
+    x = sig.dropna().astype(float)
+    if x.empty:
+        keys = ("n", "mean", "sd", "skew", "kurtosis", "min", "p01", "p50", "p99", "max")
+        return dict.fromkeys(keys, np.nan) | {"n": 0}
+    return {
+        "n": int(len(x)),
+        "mean": float(x.mean()),
+        "sd": float(x.std()),
+        "skew": float(x.skew()),
+        "kurtosis": float(x.kurtosis()),
+        "min": float(x.min()),
+        "p01": float(x.quantile(0.01)),
+        "p50": float(x.median()),
+        "p99": float(x.quantile(0.99)),
+        "max": float(x.max()),
+    }
+
+
 def coverage(sig, min_gap=3):
     """Where a signal actually has data, and where it does not.
 

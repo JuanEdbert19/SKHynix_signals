@@ -104,15 +104,42 @@ LATE_START_DAYS = 15
 
 # --- controls ---------------------------------------------------------------
 
-st.sidebar.header("Specification")
-# Explicit default rather than whatever sorts first: gdelt_sent_semi does, and
-# it is the one signal needing a hand-run backfill, so an alphabetical default
-# made opening the page fail on a fresh clone. naver_hynix is the primary.
 _names = sorted(signals.SIGNALS)
-sig_name = st.sidebar.selectbox(
-    "Signal", _names,
-    index=_names.index("naver_hynix") if "naver_hynix" in _names else 0)
-default_t = signals.DEFAULT_TRANSFORM.get(sig_name, "zscore")
+
+
+def _pick(label, default, key):
+    """A signal picker defaulting to `default` rather than whatever sorts first.
+
+    gdelt_sent_semi sorts first and needs a hand-run backfill, so an alphabetical
+    default made a fresh clone fail on page load.
+    """
+    return st.sidebar.selectbox(
+        label, _names, key=key,
+        index=_names.index(default) if default in _names else 0)
+
+
+# --- SIGNAL: what is being analysed -----------------------------------------
+# Construction lives here, not in a tab. Both branches produce one `sig`, so
+# there is a single analysis path downstream and nothing is rendered twice.
+st.sidebar.header("Signal")
+source = st.sidebar.radio(
+    "Source", ["Single", "Combined"], horizontal=True,
+    help="Combined multiplies an attention signal by a sentiment one: attention "
+         "enters as a trailing percentile rank in [0,1] and sentiment supplies "
+         "the sign.")
+
+if source == "Single":
+    sig_name = _pick("Signal", "naver_hynix", "sig_one")
+    att_name = sen_name = None
+    default_t = signals.DEFAULT_TRANSFORM.get(sig_name, "zscore")
+else:
+    att_name = _pick("Attention (becomes the weight)", "naver_hynix", "sig_att")
+    sen_name = _pick("Sentiment (supplies the sign)", "gdelt_sent_semi", "sig_sen")
+    sig_name = f"{att_name} × {sen_name}"
+    default_t = "raw"        # the product is already bounded and stationary
+
+# --- SPECIFICATION ----------------------------------------------------------
+st.sidebar.header("Specification")
 tkind = st.sidebar.selectbox(
     "Transform", panel_mod.TRANSFORMS, index=panel_mod.TRANSFORMS.index(default_t)
 )
@@ -130,20 +157,19 @@ DEFAULT_HORIZON = 1
 DEFAULT_START = "2023-01-01"
 
 horizon = st.sidebar.number_input("Forward horizon (days)", 1, 20, DEFAULT_HORIZON)
+quantiles = st.sidebar.slider("Quantile buckets", 3, 10, 5)
+
+# --- SAMPLE -----------------------------------------------------------------
+st.sidebar.header("Sample")
 start = st.sidebar.text_input("Start", DEFAULT_START)
 end = st.sidebar.text_input("End", "2026-08-06")
-quantiles = st.sidebar.slider("Quantile buckets", 3, 10, 5)
 
 st.sidebar.caption(
     "Primary specification for this project is **zscore / forward return (raw) / "
     "h=3 / from 2019-01-01**, fixed in advance — that is what `findings.md` and "
-    f"`run_test.py` report. This page now defaults to **h={DEFAULT_HORIZON} / from "
-    f"{DEFAULT_START}** for convenience, so anything read off it is an explicitly "
-    "secondary result until the horizon and start are set back."
-)
-st.sidebar.caption(
-    "Signal, Transform, Window, Target, Horizon and Quantiles affect the **Signal "
-    "test** tab only. The **Price** tab depends on Start and End alone."
+    f"`run_test.py` report. This page defaults to **h={DEFAULT_HORIZON} / from "
+    f"{DEFAULT_START}**, so anything read off it is an explicitly secondary "
+    "result until the horizon and start are set back."
 )
 
 if sig_name == "planted":
@@ -158,8 +184,23 @@ if sig_name == "planted":
 
 horizon = int(horizon)
 px, kospi = get_prices(start, end)
+
 try:
-    sig = signals.load_signal(sig_name, px, kospi)
+    if source == "Single":
+        sig = signals.load_signal(sig_name, px, kospi)
+    else:
+        # Each component gets its own registered transform first, then combine
+        # weights the sentiment by the attention's trailing rank. Identical to
+        # what `run_test.py --combine` does, so the two agree by construction.
+        att = panel_mod.transform(
+            signals.load_signal(att_name, px, kospi),
+            kind=signals.DEFAULT_TRANSFORM.get(att_name, "zscore"),
+            window=int(window))
+        sen = panel_mod.transform(
+            signals.load_signal(sen_name, px, kospi),
+            kind=signals.DEFAULT_TRANSFORM.get(sen_name, "raw"),
+            window=int(window))
+        sig = panel_mod.combine(att, sen, window=int(window))
 except FileNotFoundError as exc:
     # Hand-acquired sources (Naver .xlsx, GDELT backfill) are gitignored and
     # absent on a fresh clone. Their loaders raise with the recovery command;
@@ -167,6 +208,7 @@ except FileNotFoundError as exc:
     st.error(f"**`{sig_name}` has no data yet.**\n\n{exc}", icon="📥")
     st.info("Pick another signal in the sidebar to carry on in the meantime.")
     st.stop()
+
 pnl = panel_mod.build_panel(px, sig, transform_kind=tkind, window=int(window),
                             kospi=kospi, horizon=horizon)
 
@@ -174,16 +216,16 @@ fwd_col = f"{target}_{horizon}"
 res = stats.evaluate(pnl, horizon=horizon, target=target, q=quantiles)
 qt = stats.quantile_table(pnl["signal"], pnl[fwd_col], q=quantiles)
 
-tab_signal, tab_combine, tab_price = st.tabs(["Signal test", "Combine", "Price"])
+tab_describe, tab_test, tab_price = st.tabs(["Signal", "Test", "Price"])
 
-with tab_signal:
-    st.title("Signal → forward price behaviour")
-    st.caption(
-        f"SK Hynix 000660 · signal `{sig_name}` · transform `{tkind}` · "
-        f"target `{target}` · horizon {horizon}d"
-    )
+# --- signal: what the thing IS ----------------------------------------------
+# Deliberately no forward returns here. A reader should be able to judge whether
+# a signal is trustworthy before seeing whether it "worked".
 
-    # --- data coverage ------------------------------------------------------
+with tab_describe:
+    st.title(f"`{sig_name}`")
+    st.caption(f"transform `{tkind}` · {start} → {end}"
+               + (f" · attention × sentiment, rank-weighted" if source == "Combined" else ""))
 
     cov = panel_mod.coverage(pnl["signal_raw"])
     gaps, have = cov["gaps"], cov["n_have"]
@@ -226,6 +268,100 @@ with tab_signal:
                 "as NaN rather than filled, so they drop out of every statistic "
                 "instead of being counted as zero."
             )
+
+    # --- the series itself --------------------------------------------------
+
+    ser = pnl["signal"].dropna().rename("value").reset_index()
+    ser.columns = ["date", "value"]
+    st.altair_chart(
+        styled(alt.Chart(ser).mark_line(color=SERIES, strokeWidth=1).encode(
+            x=alt.X("date:T", title=None),
+            y=alt.Y("value:Q", title=f"Signal ({tkind})"),
+            tooltip=[alt.Tooltip("date:T", title="Date"),
+                     alt.Tooltip("value:Q", title="Signal", format=".3f")],
+        ).properties(title="Signal over time"), height=220),
+        width="stretch")
+
+    # --- distribution -------------------------------------------------------
+
+    desc = panel_mod.describe(pnl["signal"])
+    dc = st.columns(5)
+    dc[0].metric("Std dev", f"{desc['sd']:.2f}",
+                 help="A z-score should sit near 1.0. Much above means the "
+                      "rolling baseline is collapsing on some days.")
+    dc[1].metric("Skew", f"{desc['skew']:+.2f}")
+    dc[2].metric("Kurtosis", f"{desc['kurtosis']:.0f}",
+                 help="Normal is 0. Large values mean a few days dominate any "
+                      "level-based statistic — prefer rank IC over the HAC t "
+                      "when this is high. See methodology.md.")
+    dc[3].metric("Min / Max", f"{desc['min']:.1f} / {desc['max']:.1f}")
+    dc[4].metric("1st / 99th pct", f"{desc['p01']:.1f} / {desc['p99']:.1f}",
+                 help="Compare against Min/Max: a wide gap means the extremes "
+                      "are isolated outliers rather than a fat shoulder.")
+
+    hist = alt.Chart(ser).mark_bar(color=SERIES, opacity=0.75).encode(
+        x=alt.X("value:Q", bin=alt.Bin(maxbins=60), title=f"Signal ({tkind})"),
+        y=alt.Y("count():Q", title="Days"),
+    )
+    st.altair_chart(styled(hist.properties(title="Distribution"), height=200),
+                    width="stretch")
+
+    # --- how the two components relate, when combining ----------------------
+    # Only for a combined signal, where it answers a real question: multiplying
+    # two near-identical series gives something closer to a square than to an
+    # interaction. For a single signal there is no second series the reader
+    # cares about, so this section does not appear.
+
+    if source == "Combined":
+        st.divider()
+        st.subheader("How the two components relate")
+        st.caption(
+            f"`{att_name}` supplies the weight and `{sen_name}` the sign. If they "
+            "largely measure the same thing, their product is not an interaction."
+        )
+        corr = stats.signal_correlation(att, sen)
+        kc = st.columns(4)
+        kc[0].metric("Pearson", f"{corr['pearson']:+.3f}",
+                     help="No p-value: both series are autocorrelated, so a "
+                          "textbook correlation p-value assumes an independence "
+                          "that is not there.")
+        kc[1].metric("Spearman", f"{corr['spearman']:+.3f}", help="Rank-based.")
+        kc[2].metric("Overlapping days", f"{corr['n_overlap']:,}",
+                     help="The product is only defined here; everything else is NaN.")
+        kc[3].metric("Coverage", f"{corr['n_a']:,} / {corr['n_b']:,}",
+                     help="attention days / sentiment days, before intersecting.")
+
+        if corr["n_overlap"] < 200:
+            st.warning(f"Only {corr['n_overlap']:,} shared days — the combined "
+                       "signal inherits that limit.", icon="⚠️")
+        elif abs(corr["spearman"]) > 0.7:
+            st.warning(f"These correlate {corr['spearman']:+.2f}: they largely "
+                       "measure the same thing, so the product is closer to a "
+                       "square than to an interaction.", icon="⚠️")
+
+        pair = pd.concat([att.rename("a"), sen.rename("b")], axis=1).dropna().reset_index()
+        pair.columns = ["date", "a", "b"]
+        psc = alt.Chart(pair).mark_circle(size=22, color=SERIES, opacity=0.4).encode(
+            x=alt.X("a:Q", title=att_name, scale=alt.Scale(nice=True, zero=False)),
+            y=alt.Y("b:Q", title=sen_name, scale=alt.Scale(nice=True, zero=False)),
+            tooltip=[alt.Tooltip("date:T", title="Date"),
+                     alt.Tooltip("a:Q", format=".2f"), alt.Tooltip("b:Q", format=".2f")],
+        )
+        st.altair_chart(
+            styled((psc + psc.transform_regression("a", "b")
+                    .mark_line(color=ACCENT, strokeWidth=2))
+                   .properties(title="The two components against each other"), height=250),
+            width="stretch")
+
+
+# --- test: does it predict returns ------------------------------------------
+
+with tab_test:
+    st.title("Signal → forward price behaviour")
+    st.caption(
+        f"SK Hynix 000660 · signal `{sig_name}` · transform `{tkind}` · "
+        f"target `{target}` · horizon {horizon}d"
+    )
 
     # --- headline ----------------------------------------------------------
 
@@ -336,10 +472,17 @@ with tab_signal:
     default = stats.TAIL_Z if lo < stats.TAIL_Z < hi else float(
         tl["signal"].quantile(0.90))
     step = max(round((hi - lo) / 40, 4), 1e-4)
-    tail_z = st.slider("Outlier threshold (signal units)", lo, hi, default, step,
-                       help="Days above this count as outliers. The range follows "
-                            "the selected transform, so it is comparable only "
-                            "within one transform.")
+    # The unit depends on the transform: a z-score under zscore/dow_zscore, but
+    # the signal's own units under raw — Naver's 0-100 index, Wikipedia's view
+    # counts. Naming it after the actual transform avoids implying a z-score
+    # when the slider is reading 11.68 to 75.62.
+    UNIT = {"zscore": "z-score", "dow_zscore": "z-score vs same weekday",
+            "raw": "raw signal units"}
+    unit = UNIT.get(tkind, "signal units")
+    tail_z = st.slider(f"Outlier threshold ({unit})", lo, hi, default, step,
+                       help=f"Days above this count as outliers. Measured in "
+                            f"{unit} because the transform is `{tkind}`, so the "
+                            "cut is comparable only within one transform.")
 
     tail = stats.tail_test(tl["signal"], tl["fwd"], maxlags=horizon,
                            threshold=tail_z)
@@ -360,7 +503,7 @@ with tab_signal:
     # above 2.5%, when 2.5 is a signal-units cut. It belongs in the help text.
     tc[0].metric("Excess return, event days", f"{tail['excess']:+.2%}",
                  help=f"Mean forward return on days with signal > {tail_z:g} "
-                      "(signal units, not a return), minus the mean on all other "
+                      f"({unit}, not a return), minus the mean on all other "
                       "days. HAC dummy regression on the full sample.")
     tc[1].metric("HAC t-stat", f"{tail['t']:+.2f}")
     tc[2].metric("p (HAC)", f"{tail['p']:.4f}",
@@ -503,138 +646,6 @@ with tab_signal:
         "Inference is Newey-West HAC throughout, maxlags = horizon. "
         "**Prices** pykrx (KRX official). **β=1** assumed in the excess-return target."
     )
-
-# --- combine ----------------------------------------------------------------
-
-with tab_combine:
-    st.title("Combine two signals")
-    st.caption(
-        "Tests a different hypothesis from either signal alone: that sentiment "
-        "matters **more when people are paying attention**. Attention enters as a "
-        "trailing percentile rank in [0, 1] — a weight — and sentiment supplies "
-        "the sign, so the product is signed by the news and scaled by how much "
-        "attention was on it."
-    )
-
-    cc = st.columns(2)
-    att_name = cc[0].selectbox(
-        "Attention signal (becomes the weight)", _names,
-        index=_names.index("naver_hynix") if "naver_hynix" in _names else 0)
-    sen_name = cc[1].selectbox(
-        "Sentiment signal (supplies the sign)", _names,
-        index=_names.index("gdelt_sent_semi") if "gdelt_sent_semi" in _names else 0)
-
-    if att_name == sen_name:
-        st.warning("Pick two different signals.", icon="⚠️")
-        st.stop()
-
-    try:
-        att_raw = signals.load_signal(att_name, px, kospi)
-        sen_raw = signals.load_signal(sen_name, px, kospi)
-    except FileNotFoundError as exc:
-        st.error(f"**Missing data.**\n\n{exc}", icon="📥")
-        st.stop()
-
-    att = panel_mod.transform(
-        att_raw, kind=signals.DEFAULT_TRANSFORM.get(att_name, "zscore"),
-        window=int(window))
-    sen = panel_mod.transform(
-        sen_raw, kind=signals.DEFAULT_TRANSFORM.get(sen_name, "raw"),
-        window=int(window))
-
-    # --- how the two relate to each other ------------------------------------
-
-    corr = stats.signal_correlation(att, sen)
-    st.subheader("Correlation between the two signals")
-    kc = st.columns(4)
-    kc[0].metric("Pearson", f"{corr['pearson']:+.3f}",
-                 help="Linear. No p-value: both series are autocorrelated, so a "
-                      "textbook correlation p-value would assume independence "
-                      "that is not there.")
-    kc[1].metric("Spearman", f"{corr['spearman']:+.3f}", help="Rank-based.")
-    kc[2].metric("Overlapping days", f"{corr['n_overlap']:,}",
-                 help="The combination is only defined here. Everything else is NaN.")
-    kc[3].metric("Coverage", f"{corr['n_a']:,} / {corr['n_b']:,}",
-                 help=f"{att_name} days / {sen_name} days, before intersecting.")
-
-    if corr["n_overlap"] < 200:
-        st.warning(
-            f"Only {corr['n_overlap']:,} shared days. A correlation on this few "
-            "observations is not worth much, and the combined signal inherits the "
-            "same limit.", icon="⚠️")
-    elif abs(corr["spearman"]) > 0.7:
-        st.warning(
-            f"These signals correlate {corr['spearman']:+.2f}, so they largely "
-            "measure the same thing. A product of two near-identical series is "
-            "closer to a square than to an interaction.", icon="⚠️")
-    else:
-        st.caption(
-            f"Near-independent (Spearman {corr['spearman']:+.3f}), so the "
-            "combination is not double-counting one underlying quantity — the "
-            "interaction is the only reason to expect anything from it."
-        )
-
-    pair = pd.concat([att.rename("attention"), sen.rename("sentiment")],
-                     axis=1).dropna().reset_index()
-    pair.columns = ["date", "attention", "sentiment"]
-    sc = alt.Chart(pair).mark_circle(size=24, color=SERIES, opacity=0.4).encode(
-        x=alt.X("attention:Q", title=f"{att_name} ({signals.DEFAULT_TRANSFORM.get(att_name)})",
-                scale=alt.Scale(nice=True, zero=False)),
-        y=alt.Y("sentiment:Q", title=f"{sen_name}", scale=alt.Scale(nice=True, zero=False)),
-        tooltip=[alt.Tooltip("date:T", title="Date"),
-                 alt.Tooltip("attention:Q", format=".2f"),
-                 alt.Tooltip("sentiment:Q", format=".3f")],
-    )
-    st.altair_chart(
-        styled((sc + sc.transform_regression("attention", "sentiment")
-                .mark_line(color=ACCENT, strokeWidth=2))
-               .properties(title="The two signals against each other"), height=260),
-        width="stretch")
-
-    st.divider()
-
-    # --- the combined signal -------------------------------------------------
-
-    combo = panel_mod.combine(att, sen, window=int(window))
-    cpnl = panel_mod.build_panel(px, combo, transform_kind="raw",
-                                 window=int(window), kospi=kospi, horizon=horizon)
-    cres = stats.evaluate(cpnl, horizon=horizon, target=target, q=quantiles)
-
-    st.subheader(f"`{att_name}` × `{sen_name}` against forward returns")
-    m = st.columns(5)
-    m[0].metric("Rank IC", f"{cres['ic']:+.3f}")
-    m[1].metric("HAC t-stat", f"{cres['t_hac']:+.2f}")
-    m[2].metric("p (HAC)", f"{cres['p_hac']:.4f}",
-                delta="significant" if cres["p_hac"] < stats.ALPHA else "not significant",
-                delta_color="normal" if cres["p_hac"] < stats.ALPHA else "off")
-    m[3].metric("Top−bottom spread", f"{cres['ls_spread']:+.2%}",
-                help=f"HAC t = {cres['ls_t']:+.2f}, p = {cres['ls_p']:.4f}")
-    m[4].metric("Observations", f"{int(cres['n']):,}")
-
-    cqt = stats.quantile_table(cpnl["signal"], cpnl[f"{target}_{horizon}"], q=quantiles)
-    if not cqt.empty:
-        cqt = cqt.assign(lo=cqt["mean"] - cqt["se"], hi=cqt["mean"] + cqt["se"])
-        b = alt.Chart(cqt).encode(x=alt.X("bucket:O", title="Combined-signal quantile",
-                                          axis=alt.Axis(labelAngle=0)))
-        st.altair_chart(
-            styled((b.mark_bar(color=SERIES, cornerRadiusEnd=4, size=34).encode(
-                        y=alt.Y("mean:Q", title=f"Mean {TARGET_SHORT[target].lower()} ({horizon}d)",
-                                axis=alt.Axis(format=".2%")),
-                        tooltip=[alt.Tooltip("bucket:O"), alt.Tooltip("mean:Q", format=".4f"),
-                                 alt.Tooltip("n:Q")])
-                    + b.mark_rule(color=INK, opacity=0.55, strokeWidth=2).encode(
-                        y="lo:Q", y2="hi:Q"))
-                   .properties(title="Mean forward return by combined-signal quantile")),
-            width="stretch")
-
-    st.caption(
-        f"**Exploratory.** This is an additional test on a question already examined "
-        f"several ways, and both components read null on their own. Reproduce from the "
-        f"command line with `python scripts/run_test.py --combine "
-        f"{att_name},{sen_name} --target {target} --horizon {horizon}` — nothing here "
-        "is registered as a signal, so that command is the only record."
-    )
-
 
 # --- price ------------------------------------------------------------------
 
