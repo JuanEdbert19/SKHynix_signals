@@ -790,6 +790,33 @@ Google Trends requires `pytrends` with its retry config removed; see the note ab
 
 ---
 
+## GDELT query set (open, 2026-08-29)
+
+The sentiment signal's dominant defect is **too few headlines per day** — median 4, which
+leaves ~70% of the daily mean as sampling noise (reliability 0.30, or 0.14 once syndicated
+duplicates are removed). Pooling more queries is the only fix that attacks that rather than
+averaging around it, so `signals.GDELT_QUERIES` is a tuple and results are deduplicated on
+`url`.
+
+Currently `("HBM memory",)`, which yields ~58% on-topic titles. Candidates under measurement:
+`DRAM`, `NAND flash`, `SK Hynix`, `memory chip`, `semiconductor memory`.
+
+`scripts/probe_gdelt.py` samples three months per candidate (2021-03, 2024-03, 2026-03) and
+ranks them by **on-topic articles per day** — deliberately not by any return relationship,
+since queries must be chosen on coverage, not on which one happens to produce a result.
+
+Two cost notes, both measured the hard way:
+
+- a full 2019–2026 backfill for one query is **~24 hours**, not the hour the module docstring
+  originally estimated. The binding constraint is GDELT's 1-request-per-5s limit, enforced by
+  IP block, not the data volume.
+- **the probe itself is not quick.** A busy month splits recursively down to 6h windows, so a
+  single query-month can be ~100 requests. Budget hours, not minutes, for five candidates.
+
+Queries overlap heavily — the same article matches `HBM memory` and `DRAM` — so a candidate's
+*marginal* contribution after `url` deduplication is far below its raw count. That is what the
+probe measures.
+
 ## Open decisions
 
 1. ~~Tweet source — A–D above.~~ **Closed 2026-08-24.** Every option is blocked, priced out

@@ -9,6 +9,8 @@ detected — until both hold, a null result on a real signal cannot be
 distinguished from a broken pipeline.
 """
 
+import re
+
 import numpy as np
 import pandas as pd
 
@@ -170,13 +172,9 @@ def gdelt_sent_semi(px, kospi=None):
 
     Registered against fwd_exret rather than fwd_ret - see CLAUDE.md.
     """
-    from quant import gdelt, sentiment
+    from quant import sentiment
 
-    # allow_fetch=False: the backfill is hundreds of rate-limited requests and
-    # belongs to scripts/fetch_gdelt.py. Without this, opening the dashboard
-    # starts one, because this signal sorts first and is the default selection.
-    arts = gdelt.load_articles(GDELT_QUERY, px.index[0], px.index[-1],
-                               allow_fetch=False)
+    arts = load_gdelt_articles(px.index[0], px.index[-1])
     if arts.empty:
         return pd.Series(np.nan, index=px.index, name="gdelt_sent_semi")
     scored = pd.Series(sentiment.score_headlines(arts["title"]).to_numpy(),
@@ -186,7 +184,59 @@ def gdelt_sent_semi(px, kospi=None):
     ).rename("gdelt_sent_semi")
 
 
-GDELT_QUERY = "HBM memory"
+# Queries are pooled, not alternatives. The signal's dominant defect is too few
+# headlines per day - the median day had 4, leaving ~70% of the daily mean as
+# sampling noise (reliability 0.30, and 0.14 once syndicated duplicates are
+# removed). More on-topic articles per day is the only fix that attacks that
+# rather than averaging around it. Candidates were chosen by
+# scripts/probe_gdelt.py on coverage alone, before the specification was frozen.
+GDELT_QUERIES = ("HBM memory",)
+
+# Which headlines belong to the construct. GDELT matches the article *body* but
+# returns only the title, so a body-relevant match routinely arrives as a title
+# about something else: 30.5% of the corpus was off-topic - Radeon GPU reviews,
+# TikTok, CAE toolkits - and only 13.2% named SK Hynix at all. Filtering to this
+# vocabulary raised reliability from 0.30 to 0.48, the single largest measured
+# improvement. See methodology.md.
+ON_TOPIC = re.compile(
+    r"hynix|hbm|dram|nand|memory|micron|samsung|semiconductor|chip|"
+    r"foundry|tsmc|wafer|nvidia",
+    re.I,
+)
+
+
+def load_gdelt_articles(start, end, allow_fetch=False):
+    """Pooled, filtered headlines for the sentiment signal.
+
+    allow_fetch=False by default: the backfill is hundreds of rate-limited
+    requests and belongs to scripts/fetch_gdelt.py. Without it, opening the
+    dashboard would start one.
+
+    Two filters, both correctness rather than taste. Non-English articles (2.6%)
+    are scored by an English-only model, which collapses them toward neutral
+    (sd 0.05-0.18 against 0.53 for English) and dilutes the daily mean. Off-topic
+    articles are noise in the construct by definition.
+    """
+    from quant import gdelt
+
+    frames = [gdelt.load_articles(q, start, end, allow_fetch=allow_fetch)
+              for q in GDELT_QUERIES]
+    arts = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    if arts.empty:
+        return arts
+    # Pooled queries overlap heavily - the same article matches "HBM memory" and
+    # "DRAM" - and a duplicate would weight that story once per query it hit.
+    arts = arts.drop_duplicates("url").sort_values("seendate").reset_index(drop=True)
+
+    clean = arts["title"].map(_clean_title)
+    keep = (arts["language"].str.lower() == "english") & clean.str.contains(ON_TOPIC)
+    return arts[keep].reset_index(drop=True)
+
+
+def _clean_title(t):
+    from quant import sentiment
+
+    return sentiment.clean_headline(t)
 
 SIGNALS = {
     "noise": noise,
@@ -238,13 +288,18 @@ DEFAULT_TRANSFORM = {"noise": "raw", "planted": "raw", "past_return": "raw",
                      "naver_hynix": "dow_zscore", "naver_semi": "dow_zscore",
                      "naver_hbm": "dow_zscore", "naver_memory": "dow_zscore",
                      "naver_samsung": "dow_zscore",
-                     # PROVISIONAL - the weekday diagnostic has not been run yet
-                     # (no data fetched). Sentiment is a mean of bounded scores
-                     # rather than an accumulated count, so Monday's three-day
-                     # bucket should not be mechanically biased the way the
-                     # attention signals are; "raw" follows from that reasoning,
-                     # not from a measurement. Re-check before quoting a result.
-                     "gdelt_sent_semi": "raw"}
+                     # Was "raw" and marked PROVISIONAL. Two measurements settled
+                     # it. First, raw is not centred: FinBERT scores this corpus
+                     # positive on 86% of days (mean +0.199), which makes the
+                     # tail test's `lower` and `both` sides meaningless and
+                     # breaks combine()'s premise that sentiment supplies a sign.
+                     # zscore centres it to ~50%. Second, plain zscore rather
+                     # than dow_zscore because the weekday diagnostic came back
+                     # clean - a mean of bounded scores does not accumulate
+                     # between closes, so Monday's three-day bucket carries no
+                     # mechanical bias. This default was unusable until
+                     # panel.transform grew min_periods; see methodology.md.
+                     "gdelt_sent_semi": "zscore"}
 
 
 def load_signal(name, px, kospi=None, **kwargs):

@@ -124,19 +124,33 @@ def _pick(label, default, key):
 st.sidebar.header("Signal")
 source = st.sidebar.radio(
     "Source", ["Single", "Combined"], horizontal=True,
-    help="Combined multiplies an attention signal by a sentiment one: attention "
-         "enters as a trailing percentile rank in [0,1] and sentiment supplies "
-         "the sign.")
+    help="Combined folds an attention signal and a sentiment one into a single "
+         "series. How they are folded is the Rule control below.")
 
+combine_rule, combine_weight = "product", 0.0
 if source == "Single":
     sig_name = _pick("Signal", "naver_hynix", "sig_one")
     att_name = sen_name = None
     default_t = signals.DEFAULT_TRANSFORM.get(sig_name, "zscore")
 else:
-    att_name = _pick("Attention (becomes the weight)", "naver_hynix", "sig_att")
-    sen_name = _pick("Sentiment (supplies the sign)", "gdelt_sent_semi", "sig_sen")
+    att_name = _pick("Attention", "naver_hynix", "sig_att")
+    sen_name = _pick("Sentiment", "gdelt_sent_semi", "sig_sen")
+    combine_rule = st.sidebar.radio(
+        "Rule", panel_mod.COMBINE_RULES, horizontal=True,
+        help="product: attention as a trailing percentile rank in [0,1] times "
+             "sentiment, which supplies the sign. linear: z(attention) + w × "
+             "z(sentiment), with w signed.")
+    if combine_rule == "linear":
+        # Signed, and the negative half is the point: on their own top-25 days
+        # attention ran +0.94% and sentiment -0.97%, so a non-negative weight
+        # makes them cancel. w=0 is attention alone, which anchors the sweep.
+        combine_weight = st.sidebar.slider(
+            "Weight on sentiment", -1.0, 1.0, 0.0, 0.05,
+            help="Signed. 0 reduces to attention alone. Negative is meaningful "
+                 "— the two signals were measured pointing opposite ways.")
     sig_name = f"{att_name} × {sen_name}"
-    default_t = "raw"        # the product is already bounded and stationary
+    # Both rules already return a bounded, stationary series.
+    default_t = "raw"
 
 # --- SPECIFICATION ----------------------------------------------------------
 st.sidebar.header("Specification")
@@ -190,8 +204,8 @@ try:
         sig = signals.load_signal(sig_name, px, kospi)
     else:
         # Each component gets its own registered transform first, then combine
-        # weights the sentiment by the attention's trailing rank. Identical to
-        # what `run_test.py --combine` does, so the two agree by construction.
+        # folds them by the selected rule. Identical to what
+        # `run_test.py --combine` does, so the two agree by construction.
         att = panel_mod.transform(
             signals.load_signal(att_name, px, kospi),
             kind=signals.DEFAULT_TRANSFORM.get(att_name, "zscore"),
@@ -200,7 +214,8 @@ try:
             signals.load_signal(sen_name, px, kospi),
             kind=signals.DEFAULT_TRANSFORM.get(sen_name, "raw"),
             window=int(window))
-        sig = panel_mod.combine(att, sen, window=int(window))
+        sig = panel_mod.combine(att, sen, window=int(window),
+                                rule=combine_rule, weight=combine_weight)
 except FileNotFoundError as exc:
     # Hand-acquired sources (Naver .xlsx, GDELT backfill) are gitignored and
     # absent on a fresh clone. Their loaders raise with the recovery command;
@@ -316,8 +331,9 @@ with tab_describe:
         st.divider()
         st.subheader("How the two components relate")
         st.caption(
-            f"`{att_name}` supplies the weight and `{sen_name}` the sign. If they "
-            "largely measure the same thing, their product is not an interaction."
+            f"`{att_name}` and `{sen_name}`. Under `product` they are not an "
+            "interaction if they largely measure the same thing; under `linear` "
+            "a near-zero correlation is what makes the signed weight meaningful."
         )
         corr = stats.signal_correlation(att, sen)
         kc = st.columns(4)

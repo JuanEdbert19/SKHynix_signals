@@ -11,6 +11,11 @@ import pandas as pd
 
 HORIZON = 3
 
+# Fewest observations a rolling baseline may be computed from. Both a mean and a
+# standard deviation are estimated from it, and the sd is what makes a z-score
+# explode when it collapses toward zero.
+MIN_BASELINE = 10
+
 
 def add_targets(px, kospi=None, horizon=HORIZON):
     """Forward return and forward excess return over `horizon` trading days.
@@ -35,21 +40,35 @@ def add_targets(px, kospi=None, horizon=HORIZON):
     return out
 
 
-def transform(sig, kind="zscore", window=20):
+def transform(sig, kind="zscore", window=20, min_periods=None):
     """Apply a stationarity transform to a raw signal series.
 
     kind:
       raw          as-is, for signals that are already stationary
       zscore       abnormality vs a rolling baseline that EXCLUDES today
       dow_zscore   same, but the baseline is the same weekday only
+
+    Without min_periods pandas requires the window to be entirely non-NaN, which
+    silently guts any signal with gaps: gdelt_sent_semi has values on 1,435 of
+    1,865 trading days, and a bare rolling(20) left 393 of them - 73% of the
+    available days discarded, with nothing in the output saying so.
+
+    The default is MIN_BASELINE, capped at the window itself. A window already
+    at or below that floor is required in full rather than relaxed, because the
+    cure would be worse than the disease: dow_zscore's window is 4 same-weekday
+    observations, and methodology.md records it reaching z = +124.7 when that sd
+    collapses. Allowing 2 makes the sd |x1-x2|/sqrt(2), which is not a baseline.
+    So zscore(20) relaxes to 10 and dow_zscore keeps its full 4 - the gap bug is
+    a long-window problem and the fix is confined to long windows.
     """
     if kind == "raw":
         return sig.astype(float)
     if kind == "zscore":
+        mp = min_periods if min_periods is not None else min(window, MIN_BASELINE)
         # .shift(1) is load-bearing: without it day t sits in its own baseline,
         # which leaks the very deviation the z-score is meant to measure.
-        base = sig.rolling(window).mean().shift(1)
-        sd = sig.rolling(window).std().shift(1)
+        base = sig.rolling(window, min_periods=mp).mean().shift(1)
+        sd = sig.rolling(window, min_periods=mp).std().shift(1)
         return (sig - base) / sd.replace(0.0, np.nan)
     if kind == "dow_zscore":
         # For a signal accumulated between market closes, Monday's bucket spans
@@ -63,10 +82,11 @@ def transform(sig, kind="zscore", window=20):
         # window is in trading days, so window // 5 same-weekday observations
         # span the same calendar period as the plain zscore baseline.
         n = max(window // 5, 2)
+        mp = min_periods if min_periods is not None else min(n, MIN_BASELINE)
         out = {}
         for _, g in sig.groupby(sig.index.dayofweek):
-            base = g.rolling(n).mean().shift(1)
-            sd = g.rolling(n).std().shift(1)
+            base = g.rolling(n, min_periods=mp).mean().shift(1)
+            sd = g.rolling(n, min_periods=mp).std().shift(1)
             out[_] = (g - base) / sd.replace(0.0, np.nan)
         return pd.concat(out.values()).sort_index()
     raise ValueError(f"unknown transform: {kind}")
@@ -109,24 +129,52 @@ def trailing_pct_rank(sig, window=20):
     return out.rename(sig.name)
 
 
-def combine(attention, sentiment, window=20):
-    """Attention as a non-negative weight, sentiment as the sign.
+COMBINE_RULES = ("product", "linear")
 
-    A plain product of the two inverts on days when BOTH are negative - 8% of
-    the overlapping sample - so low attention plus bad news would score like
-    high attention plus good news. Ranking attention into [0, 1] makes the sign
-    always the sentiment's, and the magnitude a measure of how much attention
-    was on it.
 
-    The rank also caps the influence of a single day: dow_zscore reaches +50.65
-    on this data, which as a raw multiplier would swamp every other observation.
+def combine(attention, sentiment, window=20, rule="product", weight=0.0):
+    """Fold an attention signal and a sentiment signal into one series.
 
-    NaN wherever either input is missing. The product of a known sentiment and
-    an unknown attention is unknown, not zero.
+    Both rules return NaN wherever either input is missing. The combination of a
+    known sentiment and an unknown attention is unknown, not zero.
+
+    `product` - attention as a non-negative weight, sentiment as the sign.
+      A plain product inverts when BOTH are negative (8% of the overlapping
+      sample), so low attention plus bad news would score like high attention
+      plus good news. Ranking attention into [0, 1] makes the sign always the
+      sentiment's and the magnitude a measure of how much attention was on it.
+      The rank also caps a single day's influence: dow_zscore reaches +50.65
+      here, which as a raw multiplier would swamp every other observation.
+
+    `linear` - z(attention) + weight * z(sentiment), `weight` SIGNED.
+      The sign matters because the two signals were measured pointing opposite
+      ways: on their own top-25 days attention ran +0.94% and sentiment -0.97%,
+      at a mutual correlation of -0.03. A non-negative weight makes them cancel,
+      which is what the product cannot express and this can. weight = 0 reduces
+      exactly to attention alone, which is what makes a weight sweep readable.
+
+      Standardising both first is load-bearing: dow_zscore attention and zscore
+      sentiment have very different scales, so an unstandardised sum would be
+      attention plus a rounding error. It reuses transform(kind="zscore"), whose
+      .shift(1) matters here too - a day inside its own baseline pulls the mean
+      toward itself, attenuating exactly the outliers the tail test measures.
+
+    Known limitation, measured rather than assumed: attention's effect lives in
+    a fat tail (kurtosis 9.9) and sentiment is near-Gaussian (0.4), so ANY
+    blending thins the tail the effect depends on - a 50/50 linear mix left 5
+    outlier days above z=2.5 where attention alone had 26. See methodology.md.
     """
-    weight = trailing_pct_rank(attention, window=window)
-    both = pd.concat([weight.rename("w"), sentiment.rename("s")], axis=1)
-    return (both["w"] * both["s"]).rename("combined")
+    if rule not in COMBINE_RULES:
+        raise ValueError(f"unknown rule {rule!r}; expected one of {COMBINE_RULES}")
+
+    if rule == "product":
+        w = trailing_pct_rank(attention, window=window)
+        both = pd.concat([w.rename("w"), sentiment.rename("s")], axis=1)
+        return (both["w"] * both["s"]).rename("combined")
+
+    both = pd.concat([transform(attention, "zscore", window).rename("a"),
+                      transform(sentiment, "zscore", window).rename("s")], axis=1)
+    return (both["a"] + weight * both["s"]).rename("combined")
 
 
 def describe(sig):

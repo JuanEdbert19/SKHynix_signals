@@ -1434,3 +1434,174 @@ def test_evaluate_threads_the_side_through():
     up = stats.evaluate(pnl, horizon=3, tail_z=1.0, tail_side="upper")
     dn = stats.evaluate(pnl, horizon=3, tail_z=1.0, tail_side="lower")
     assert up["tail_excess"] != dn["tail_excess"], "side had no effect on the result"
+
+
+# --- min_periods: the gap bug -----------------------------------------------
+
+
+def _gappy(px, keep=0.75, seed=11):
+    """A signal present on ~75% of days, like GDELT news."""
+    rng = np.random.default_rng(seed)
+    s = pd.Series(rng.standard_normal(len(px)) + 10.0, index=px.index)
+    return s.mask(rng.random(len(px)) > keep)
+
+
+def test_zscore_survives_a_gappy_signal():
+    """A bare rolling(window) needs the whole window non-NaN, which guts gaps.
+
+    gdelt_sent_semi had values on 1,435 of 1,865 trading days and zscore left
+    393 of them - 73% discarded silently, with nothing in the output saying so.
+    Only gappy signals were affected, which is why it survived undetected: every
+    attention signal has essentially full coverage.
+    """
+    px = fake_px()
+    s = _gappy(px)
+    have = s.notna().sum()
+
+    kept = panel.transform(s, "zscore", window=20).notna().sum()
+    strict = ((s.rolling(20).mean().shift(1)).notna()
+              & (s.rolling(20).std().shift(1)).notna() & s.notna()).sum()
+
+    assert kept > 0.75 * have, f"kept only {kept} of {have} available days"
+    assert kept > 3 * strict, (
+        f"min_periods bought nothing: {kept} kept vs {strict} under the old rule"
+    )
+
+
+def test_dow_zscore_does_not_relax_its_four_day_baseline():
+    """dow_zscore must still require its full window, and this is deliberate.
+
+    Its baseline is only window//5 = 4 same-weekday observations. Relaxing that
+    to 2 makes the sd |x1-x2|/sqrt(2), which is not a baseline - methodology.md
+    records this transform already reaching z = +124.7 when the sd collapses.
+    MIN_BASELINE caps at the window for exactly this reason, so the gap fix
+    stays confined to long windows.
+
+    This also pins a headline number: relaxing it moved naver_hynix at h=1 from
+    p 0.0444 to 0.0520 by adding 10 warm-up days. The choice is made on baseline
+    quality, not on which side of 0.05 it lands.
+    """
+    px = fake_px()
+    s = _gappy(px)
+    n = max(20 // 5, 2)
+    relaxed = panel.transform(s, "dow_zscore", 20, min_periods=2).notna().sum()
+    default = panel.transform(s, "dow_zscore", 20).notna().sum()
+    assert default < relaxed, "dow_zscore silently relaxed its baseline"
+    assert panel.MIN_BASELINE >= n, "MIN_BASELINE no longer caps at this window"
+
+
+def test_min_periods_only_adds_days_and_never_changes_one():
+    """The fix must be purely additive: no day that already had a value moves.
+
+    It is NOT invisible to a full-coverage signal, which is worth stating because
+    the first version of this test assumed it was. A shorter baseline is allowed
+    during warm-up, so `zscore` gains the first ~10 days of any series. What must
+    never happen is an existing value changing, because that would silently
+    rewrite history for every signal at once.
+
+    Only gdelt_sent_semi uses `zscore`; the attention signals use `dow_zscore`,
+    which does not relax. That is why no number in findings.md moves - see
+    test_dow_zscore_does_not_relax_its_four_day_baseline.
+    """
+    px = fake_px()
+    s = pd.Series(np.arange(len(px), dtype=float) % 37 + 1.0, index=px.index)
+    new = panel.transform(s, "zscore", 20)
+    old = panel.transform(s, "zscore", 20, min_periods=20)
+
+    overlap = old.notna()
+    pd.testing.assert_series_equal(new[overlap], old[overlap])
+    assert new.notna().sum() > old.notna().sum(), "warm-up days were not recovered"
+
+
+# --- combination rules ------------------------------------------------------
+
+
+def test_product_rule_is_unchanged():
+    """The default must reproduce the pre-existing product exactly."""
+    px = fake_px()
+    att = build("noise", seed=1)["signal"]
+    sen = build("noise", seed=2)["signal"]
+    got = panel.combine(att, sen, window=20)
+    want = panel.trailing_pct_rank(att, window=20) * sen
+    pd.testing.assert_series_equal(got, want.rename("combined"))
+
+
+def test_linear_at_zero_weight_is_attention_alone():
+    """w=0 must reduce exactly to z(attention) — what makes a sweep readable."""
+    px = fake_px()
+    att = build("noise", seed=1)["signal"]
+    sen = build("noise", seed=2)["signal"]
+    got = panel.combine(att, sen, rule="linear", weight=0.0, window=20)
+    want = panel.transform(att, "zscore", 20)
+    pd.testing.assert_series_equal(got.dropna(), want.rename("combined").dropna())
+
+
+def test_linear_weight_is_signed():
+    """A negative weight must flip sentiment's contribution, not ignore it.
+
+    The two real signals were measured pointing opposite ways (+0.94% vs -0.97%
+    on their own top-25 days), so the negative half of the range is the half
+    that matters. A rule that silently took |weight| would erase that.
+    """
+    att = build("noise", seed=1)["signal"]
+    sen = build("noise", seed=2)["signal"]
+    base = panel.combine(att, sen, rule="linear", weight=0.0, window=20)
+    pos = panel.combine(att, sen, rule="linear", weight=+0.5, window=20)
+    neg = panel.combine(att, sen, rule="linear", weight=-0.5, window=20)
+    dp, dn = (pos - base).dropna(), (neg - base).dropna()
+    assert dp.abs().sum() > 0, "weight had no effect"
+    pd.testing.assert_series_equal(dp, -dn)
+
+
+def test_combine_rejects_an_unknown_rule():
+    att = build("noise", seed=1)["signal"]
+    with pytest.raises(ValueError, match="unknown rule"):
+        panel.combine(att, att, rule="geometric")
+
+
+def test_both_rules_are_nan_where_either_input_is():
+    """A combination of a known value and an unknown one is unknown, not zero."""
+    att = build("noise", seed=1)["signal"].copy()
+    sen = build("noise", seed=2)["signal"].copy()
+    sen.iloc[100:110] = np.nan
+    for rule in panel.COMBINE_RULES:
+        out = panel.combine(att, sen, rule=rule, weight=0.5, window=20)
+        assert out.iloc[100:110].isna().all(), f"{rule} invented values"
+
+
+def test_dashboard_offers_both_combine_rules_and_agrees_with_the_library():
+    """The rule selector must render, and the tab must compute nothing itself.
+
+    A dashboard that re-derives a statistic can drift from run_test.py silently.
+    This asserts the sidebar wires the rule and the signed weight straight into
+    panel.combine, which is the single place either is implemented.
+    """
+    from streamlit.testing.v1 import AppTest
+
+    at = AppTest.from_file(str(ROOT / "app.py"), default_timeout=900).run()
+
+    def radio(label):
+        return [r for r in at.radio if r.label == label][0]
+
+    radio("Source").set_value("Combined")
+    at.run()
+    assert not at.exception
+    assert list(radio("Rule").options) == list(panel.COMBINE_RULES)
+
+    # The weight is meaningless for the product, so it must not be offered there.
+    radio("Rule").set_value("product")
+    at.run()
+    assert not at.exception
+    assert not [s for s in at.slider if s.label == "Weight on sentiment"]
+
+    radio("Rule").set_value("linear")
+    at.run()
+    assert not at.exception
+    weight = [s for s in at.slider if s.label == "Weight on sentiment"]
+    assert weight, "linear must expose its weight"
+    # Signed: the two real signals were measured pointing opposite ways.
+    assert weight[0].min < 0, "a non-negative-only weight cannot express that"
+
+    weight[0].set_value(-0.5)
+    at.run()
+    assert not at.exception

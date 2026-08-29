@@ -27,9 +27,19 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--signal", choices=sorted(signals.SIGNALS))
     ap.add_argument("--combine", metavar="ATTENTION,SENTIMENT",
-                    help="multiplicative combination of two registered signals: "
-                         "attention enters as a trailing percentile rank in [0,1], "
-                         "sentiment supplies the sign. Alternative to --signal.")
+                    help="combination of two registered signals. Alternative to "
+                         "--signal; see --combine-rule for how they are folded.")
+    ap.add_argument("--combine-rule", default="product", dest="combine_rule",
+                    choices=panel_mod.COMBINE_RULES,
+                    help="product: attention as a trailing percentile rank in "
+                         "[0,1] times sentiment, which supplies the sign. "
+                         "linear: z(attention) + w*z(sentiment), w signed.")
+    ap.add_argument("--combine-weight", type=float, default=0.0,
+                    dest="combine_weight",
+                    help="SIGNED coefficient on sentiment for --combine-rule "
+                         "linear. 0 reduces to attention alone; negative is "
+                         "meaningful, the two signals were measured pointing "
+                         "opposite ways. Ignored by the product rule.")
     ap.add_argument("--transform", default=None, choices=panel_mod.TRANSFORMS,
                     help="default is per-signal; 'zscore' for count-style signals")
     ap.add_argument("--horizon", type=int, default=panel_mod.HORIZON)
@@ -66,9 +76,14 @@ def main():
             signals.load_signal(sen_name, px, kospi),
             kind=signals.DEFAULT_TRANSFORM.get(sen_name, "raw"),
             window=args.window)
-        sig = panel_mod.combine(att, sen, window=args.window)
-        args.signal = f"combine({att_name}x{sen_name})"
-        tkind = "raw"   # the product is already bounded and stationary
+        sig = panel_mod.combine(att, sen, window=args.window,
+                                rule=args.combine_rule, weight=args.combine_weight)
+        args.signal = (f"combine({att_name}x{sen_name},{args.combine_rule}"
+                       + (f",w={args.combine_weight:g}"
+                          if args.combine_rule == "linear" else "") + ")")
+        # Both rules already return a bounded, stationary series: the product is
+        # a [0,1] rank times a z-score, and linear is a sum of z-scores.
+        tkind = "raw"
     else:
         tkind = args.transform or signals.DEFAULT_TRANSFORM.get(args.signal, "zscore")
         sig = signals.load_signal(args.signal, px, kospi)

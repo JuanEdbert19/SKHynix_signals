@@ -212,6 +212,75 @@ sidebar setting rather than a fetch decision.
 Days with **zero** articles are NaN, not zero. An absent headline is an undefined sentiment,
 not a neutral one.
 
+### Most of the daily signal was sampling noise (measured 2026-08-29)
+
+The signal is the mean of a day's headline scores, and the median day supplied **4
+headlines** against a per-headline sd of 0.53. Decomposing the daily series into what varies
+because the news changed and what varies because of *which articles GDELT happened to index*:
+
+| | variance | sd |
+|---|---|---|
+| observed daily mean | 0.0820 | 0.286 |
+| sampling noise | 0.0578 | 0.240 |
+| true tone | 0.0242 | 0.156 |
+
+**Reliability = 0.30** — about 70% of the day-to-day movement carried no information about
+the news. A true correlation is attenuated to `sqrt(0.30) = 0.54x`. And 0.30 is the
+optimistic reading: 19.6% of titles are exact syndicated duplicates, which inflate the
+effective sample size, and deduping first gives **0.14**.
+
+Corroborated independently by persistence. A real news narrative lasts days, so a good
+measurement should correlate with yesterday's: the attention signals run **+0.7** at lag 1,
+this one ran **+0.20**.
+
+**Three fixes, all measured rather than assumed:**
+
+| Change | Reliability |
+|---|---|
+| as it shipped | 0.30 |
+| + English only (2.6% were scored by an English-only model) | 0.33 |
+| + on-topic filter | **0.48** |
+
+The relevance filter is the large one and it removes real junk, not borderline cases:
+**30.5%** of the corpus was off-topic — *"AMD Radeon VII review: Is 4K gaming enough?"*,
+*"Goodbye to my Chinese spy TikTok"*, *"Tech Soft 3D Launches CEETRON Toolkits"* — against
+4.5% market-wide macro. Only **13.2%** of titles named SK Hynix at all. `signals.ON_TOPIC`
+is the memory/chip vocabulary that survives.
+
+**The signal was not centred**, which broke two things silently. FinBERT scores this corpus
+positive on **86%** of days (mean +0.199), so `stats.tail_test`'s `lower` and `both` sides
+were meaningless on it, and `combine`'s premise that sentiment supplies a *sign* was false —
+it was a nearly-always-positive multiplier. `DEFAULT_TRANSFORM` moved from `raw` to `zscore`,
+which centres it to **51.8%**. That default was unusable until the `min_periods` bug below
+was fixed.
+
+### The `min_periods` bug (found 2026-08-29)
+
+`panel.transform` called `rolling(window)` with no `min_periods`, and pandas then requires
+the window to be **entirely non-NaN**. On a signal with gaps that is catastrophic and silent:
+
+```
+gdelt_sent_semi available on   1,435 of 1,865 trading days (77%)
+after zscore(window=20)          393 days   -> 73% of available days discarded
+```
+
+Nothing in the output said so. It survived undetected because **only gappy signals are
+affected** — every attention signal has essentially full coverage — and the one signal that
+has gaps was the one pinned to `raw`, so its `zscore` path was never exercised.
+
+The fix is `MIN_BASELINE = 10`, **capped at the window**. The cap is the load-bearing half:
+`dow_zscore`'s window is only `window // 5 = 4` same-weekday observations, and relaxing that
+to 2 makes the sd `|x1-x2|/sqrt(2)`, which is not a baseline — this transform already reaches
+z = +124.7 when its sd collapses. So `zscore(20)` relaxes to 10 and `dow_zscore` keeps its
+full 4; the gap fix is confined to long windows, where the bug actually was.
+
+**This choice moves a headline number, and the reasoning is deliberately not about that.**
+Relaxing `dow_zscore` to 2 would add 10 warm-up days to `naver_hynix` at h=1 and move it from
+**p 0.0444 to p 0.0520** — across 0.05. The cap was chosen on baseline quality, which is an
+argument that would read the same if the p-value moved the other way. What the sensitivity
+shows is that the headline p is fragile to ten days at the start of the sample, and that is
+worth knowing regardless of which side it lands on.
+
 ## Combining signals
 
 **A plain product of attention and sentiment inverts on 8% of days.** Attention as
@@ -247,6 +316,95 @@ no p-value, for the same reason `rank_ic` does not — both series are autocorre
 Measured for the pair the tab defaults to: `naver_hynix` × `gdelt_sent_semi` correlate
 **−0.007 Pearson, +0.013 Spearman**. Near-independent, so the product is not double-counting
 one quantity, and the interaction is the only reason to expect anything from it.
+
+### Why blending underperforms either signal (measured 2026-08-29)
+
+Two mechanisms, both structural rather than small-sample.
+
+**Blending destroys the fat tail the attention effect lives in.** Attention is violently
+fat-tailed and sentiment is near-Gaussian, so their sum is closer to Gaussian than the
+attention signal is — and the tail test then has nothing left to test:
+
+| rule | outlier days at z>2.5 | kurtosis |
+|---|---|---|
+| attention alone | 26 | 9.9 |
+| linear 0.75 / 0.25 | 16 | 7.6 |
+| linear 0.50 / 0.50 | 5 | 2.1 |
+| product `rank(att) × sen` | 4 | 3.7 |
+| sentiment alone | 0 | 0.4 |
+
+Re-measured after the sentiment fixes above, the **product falls to a single outlier day** on
+2023+ — it is not a rule that can be evaluated on this data, and keeping it is a choice to
+preserve the interaction hypothesis rather than an expectation that it will work.
+
+**This mechanism is invisible to rank IC**, which is what made the first pass through this
+investigation reach the wrong conclusion. Rank IC is computed on all days and is immune to
+outliers by construction, so a rule that quietly deletes the outliers scores no worse on it.
+Anything comparing combination rules must be judged on the tail test.
+
+**Rules must be compared at equal event counts.** Each rule produces a differently-shaped
+distribution, so a fixed `z > 2.5` compares 26 days against 5 — a power difference, not a
+result. Comparisons use the top-*k* days instead.
+
+### The linear rule, and why its weight is signed
+
+`combine(rule="linear")` is `z(attention) + w · z(sentiment)` with **w signed**. Both inputs
+are standardised first because `dow_zscore` attention and `zscore` sentiment have very
+different scales; unstandardised, the sum would be attention plus a rounding error. `w = 0`
+reduces exactly to attention alone, which is what makes a weight sweep readable.
+
+The sign exists because, during diagnosis, the two signals appeared to point **opposite**
+ways — attention +0.94% and sentiment −0.97% on their own top-25 days, at a mutual
+correlation of −0.03. A non-negative weight makes opposing signals cancel, which the product
+cannot express and this can.
+
+**That apparent asymmetry did not survive the corrected construction.** Re-run with the
+filtered, `zscore`-centred sentiment (h=1, 2023+, `fwd_exret`, top-*k* equal counts):
+
+| w on sentiment | rank IC | tail excess | n_tail |
+|---|---|---|---|
+| −1.0 | +0.0356 | +0.54% | 51 |
+| −0.5 | +0.0440 | +0.87% | 38 |
+| **0.0** | **+0.0839** | **+1.22%** | 33 |
+| +0.5 | +0.0763 | +0.96% | 31 |
+| +1.0 | +0.0592 | +0.92% | 38 |
+
+The optimum is at **zero weight on sentiment** in both directions. The earlier negative-weight
+result was an artifact of the ad-hoc 60-day centring used while diagnosing, and is recorded
+here as a **false positive that the corrected pipeline killed** — which is precisely why the
+definition changes had to land before the rule was chosen.
+
+### A documented false positive: the "gated" rule
+
+While sweeping combination rules, *sentiment restricted to high-attention days* came back at
+**p = 0.033** on `fwd_exret`, h=1, 2023+. It is not a finding and must never be quoted as one:
+
+- it is one of **18 specifications** tried on that sample; a Bonferroni threshold is ≈0.0028
+- its sign says **good news predicts negative excess returns**, which was not the hypothesis
+- it did not survive the corrected sentiment construction
+
+It belongs beside `wiki_hynix` as a calibration point for how easily this sample manufactures
+a sub-0.05 p-value.
+
+### An untested hypothesis: sentiment may be contrarian
+
+The same sweep produced a coherent-looking pattern in the *opposite* direction to the
+project's hypothesis — high sentiment followed by **lower** excess returns, decaying with k
+the way a genuine tail effect does (h=1, `fwd_exret`, 2023+, top-k days):
+
+| top-k | excess | t | p |
+|---|---|---|---|
+| 25 | −0.97% | −1.69 | 0.091 |
+| 50 | −0.89% | −2.52 | 0.012 |
+| 100 | −0.34% | −1.31 | 0.191 |
+
+**Not a finding, and not testable on this data.** It was found by trying 21 specifications on
+2023+, so that sample can no longer evaluate it — the direction was chosen after seeing it.
+
+To test it: `gdelt_sent_semi`, `zscore`/20, `fwd_exret`, h=1, upper tail, direction fixed
+**negative**, run **once** on **2019-2022** — the years the sweep never touched. A significant
+result with a positive sign is a fail, not a discovery. Note in advance that those years are
+thin (~530 articles/year against 3,228 in 2026), so a null there is weak evidence either way.
 
 ## Reverse causality is mislabelled — UNRESOLVED (found 2026-08-29)
 

@@ -62,9 +62,10 @@ all reduce to one number per trading day, which is the only interface it require
 | `quant/gdelt.py` | News headlines from GDELT DOC 2.0 — adaptive windowing, resumable per month |
 | `quant/sentiment.py` | FinBERT headline scoring, `P(pos) − P(neg)`, cached by headline hash |
 | `quant/align.py` | UTC **and KST** signal timestamps → KRX trading date. **The only module with timezone logic** |
-| `quant/panel.py` | Forward-return targets, signal transforms, coverage and distribution summaries |
+| `quant/panel.py` | Forward-return targets, signal transforms, `combine`, coverage and distribution summaries |
 | `quant/signals.py` | Signal registry + the three validation fixtures |
 | `quant/stats.py` | Rank IC, quantile buckets, Newey-West regressions, reverse causality |
+| `scripts/probe_gdelt.py` | Measures articles/day and on-topic share for a candidate GDELT query, before committing to a backfill |
 | `scripts/run_test.py` | CLI; writes a JSON record to `results/` |
 | `app.py` | Streamlit dashboard, three tabs — a thin caller of the same functions, so it cannot drift |
 
@@ -76,24 +77,37 @@ headline metrics, quantiles, scatter, tail test, reverse causality. *Price* is t
 close chart with overlays.
 
 **Signal construction lives in the sidebar, not in a tab.** The Source toggle picks a single
-registered signal or a *combined* one — an attention signal times a sentiment one, attention
-entering as `panel.trailing_pct_rank` in [0,1] and sentiment supplying the sign, because a
-plain product inverts when both are negative. Either branch produces one `sig`, so there is a
-single analysis path and nothing is rendered twice. This replaced a Combine tab that
-re-implemented a subset of the Test tab's output.
+registered signal or a *combined* one, and a **Rule** control picks how the pair is folded —
+`panel.COMBINE_RULES`:
+
+- `product` — `trailing_pct_rank(attention) × sentiment`, attention in [0,1] as a
+  non-negative weight and sentiment supplying the sign, because a plain product inverts when
+  both are negative.
+- `linear` — `z(attention) + w · z(sentiment)`, with **w signed** and exposed as a slider.
+  `w = 0` is attention alone. Both inputs are standardised first because the two transforms
+  are on different scales.
+
+Either branch produces one `sig`, so there is a single analysis path and nothing is rendered
+twice. This replaced a Combine tab that re-implemented a subset of the Test tab's output.
 
 `trailing_pct_rank` is deliberately not in `TRANSFORMS` — `pctrank` was cut on 2026-08-10 and
 re-registering it would reverse that. The combined pair is not registered in `SIGNALS`;
-`run_test.py --combine A,B` is what keeps a combined result reproducible. See `methodology.md`.
+`run_test.py --combine A,B --combine-rule R --combine-weight W` is what keeps a combined
+result reproducible. See `methodology.md`.
 
-Sidebar groups: **Signal** (source and pickers), **Specification** (transform, target, horizon,
-window, quantiles), **Sample** (start, end).
+Sidebar groups: **Signal** (source, pickers, combine rule and weight), **Specification**
+(transform, target, horizon, window, quantiles), **Sample** (start, end).
 
 **Adding a real signal**: write a function `(px, kospi) -> Series` keyed by trading
 date and register it in `SIGNALS`, `SIGNAL_AGG` and `DEFAULT_TRANSFORM`. If it arrives as
 UTC timestamps, run it through `align.align_to_trading_days` first.
 `signals._pageview_signal` is the worked example. Nothing else changes — `app.py` and
 `run_test.py` populate their choices from `SIGNALS`.
+
+`panel.transform` takes `min_periods`, defaulting to `MIN_BASELINE = 10` **capped at the
+window**. Without it `rolling()` requires a fully non-NaN window, which discarded 73% of the
+available days on the one signal that has gaps. The cap is what keeps `dow_zscore`'s
+4-observation baseline from being relaxed to 2. See `methodology.md`.
 
 Pick `DEFAULT_TRANSFORM` by how the signal is bucketed: `"dow_zscore"` if it accumulates
 between market closes (Monday's bucket spans the weekend, so a mixed baseline reads it as
@@ -143,6 +157,14 @@ An industry query, not a company one — GDELT matches the article *body* but re
 *title*, so `"SK Hynix"` yields 15% on-topic headlines against 58% for `HBM memory`. It
 therefore measures **international semiconductor sentiment**, not SK Hynix sentiment.
 
+`GDELT_QUERIES` is a tuple and the results are **pooled**, deduplicated on `url`; more
+on-topic headlines per day is the only fix for the sampling noise that dominates this signal.
+`signals.load_gdelt_articles` is the single entry point — it pools, dedupes, and applies the
+two filters (English only, `signals.ON_TOPIC`) that every consumer must see. Its transform is
+`zscore`, not `raw`: FinBERT scores this corpus positive on 86% of days, so the uncentred
+version broke both the tail test's `lower`/`both` sides and `combine`'s sign premise. See
+`methodology.md`.
+
 **Article timestamps need no stamping function.** GDELT's `seendate` is a full UTC instant,
 so articles go straight into `align.align_to_trading_days` — unlike the pageview and Naver
 sources, which are calendar days needing a closing-edge convention.
@@ -172,8 +194,9 @@ quintile table, the tail test with its event metrics, and the reverse-causality 
 `ls_n` is reported because that test uses only the extreme buckets (~40% of the days), so
 quoting it beside the full-sample `n` would misstate what it was measured on.
 
-**The tail test is one-sided and exploratory.** `stats.tail_test` compares days above
-`TAIL_Z` against *all* others — full sample, unlike the spread — because it asks whether a
+**The tail test is one-sided by default and exploratory.** `stats.tail_test` compares days
+beyond `TAIL_Z` against *all* others — `side=` picks which tail (`upper`, `lower`, `both`),
+and `lower`/`both` assume a signal centred on zero, which `raw` is not — full sample, unlike the spread — because it asks whether a
 spike moves the stock, not whether the relationship is monotonic. `TAIL_Z = 2.5` was chosen
 after inspecting results, so `stats.tail_curve` reports the whole threshold grid and both
 the dashboard and `run_test.py` render it unconditionally beside the headline number. Never

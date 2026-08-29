@@ -28,7 +28,9 @@ from quant import gdelt, signals  # noqa: E402
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--query", default=signals.GDELT_QUERY)
+    ap.add_argument("--query", default=signals.GDELT_QUERIES[0],
+                    help="one query at a time; GDELT_QUERIES is pooled "
+                         "at read time, not fetched as a set")
     ap.add_argument("--start", default="2019-01-01")
     ap.add_argument("--end", default="2026-08-06")
     ap.add_argument("--refresh", action="store_true",
