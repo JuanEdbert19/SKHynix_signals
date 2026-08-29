@@ -1380,3 +1380,57 @@ def test_single_and_combined_paths_yield_the_same_panel_shape():
     assert a.index.equals(b.index)
     for frame in (a, b):
         assert {"signal", "signal_raw", "fwd_ret_3"} <= set(frame.columns)
+
+
+@pytest.mark.parametrize("side,expected", [
+    ("upper", [False, False, False, True, True]),
+    ("lower", [True, True, False, False, False]),
+    ("both", [True, True, False, True, True]),
+])
+def test_tail_mask_picks_the_right_side(side, expected):
+    x = pd.Series([-4.0, -3.0, 0.0, 3.0, 4.0])
+    assert stats.tail_mask(x, 2.5, side).tolist() == expected
+
+
+def test_tail_mask_rejects_an_unknown_side():
+    with pytest.raises(ValueError, match="unknown side"):
+        stats.tail_mask(pd.Series([1.0]), 2.5, "sideways")
+
+
+def test_lower_tail_finds_a_planted_negative_effect():
+    """A signal whose LOW days predict gains must be invisible to `upper`.
+
+    This is the case the side selector exists for: a one-sided test looking the
+    wrong way reports nothing, which reads identically to no effect at all.
+    """
+    px = fake_px()
+    pnl = panel.add_targets(px, horizon=3)
+    rng = np.random.default_rng(0)
+    sig = pd.Series(rng.standard_normal(len(px)), index=px.index)
+    fwd = pnl["fwd_ret_3"].copy()
+    fwd[sig < -2.0] += 0.05                      # effect ONLY in the low tail
+
+    lower = stats.tail_test(sig, fwd, maxlags=3, threshold=2.0, side="lower")
+    upper = stats.tail_test(sig, fwd, maxlags=3, threshold=2.0, side="upper")
+    assert lower["p"] < 0.01 and lower["excess"] > 0.03, lower
+    assert upper["p"] > 0.05, "the upper tail should see nothing"
+
+
+def test_both_sides_is_the_union_of_the_two():
+    px = fake_px()
+    pnl = build("noise", seed=3)
+    x = pnl["signal"]
+    n_up = stats.tail_mask(x, 1.5, "upper").sum()
+    n_dn = stats.tail_mask(x, 1.5, "lower").sum()
+    n_both = stats.tail_mask(x, 1.5, "both").sum()
+    assert n_both == n_up + n_dn, "both must be exactly the two disjoint tails"
+
+
+def test_evaluate_threads_the_side_through():
+    pnl = build("planted", seed=0)
+    for side in stats.SIDES:
+        res = stats.evaluate(pnl, horizon=3, tail_z=1.0, tail_side=side)
+        assert res["tail_side"] == side
+    up = stats.evaluate(pnl, horizon=3, tail_z=1.0, tail_side="upper")
+    dn = stats.evaluate(pnl, horizon=3, tail_z=1.0, tail_side="lower")
+    assert up["tail_excess"] != dn["tail_excess"], "side had no effect on the result"

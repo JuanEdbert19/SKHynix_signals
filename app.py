@@ -479,14 +479,31 @@ with tab_test:
     UNIT = {"zscore": "z-score", "dow_zscore": "z-score vs same weekday",
             "raw": "raw signal units"}
     unit = UNIT.get(tkind, "signal units")
-    tail_z = st.slider(f"Outlier threshold ({unit})", lo, hi, default, step,
-                       help=f"Days above this count as outliers. Measured in "
-                            f"{unit} because the transform is `{tkind}`, so the "
-                            "cut is comparable only within one transform.")
+
+    sc_, tc_ = st.columns([1, 2])
+    SIDE_LABEL = {"High only": "upper", "Low only": "lower", "Both tails": "both"}
+    side_label = sc_.radio("Which tail", list(SIDE_LABEL), horizontal=True,
+                           help="Low and Both compare against -threshold, so they "
+                                "assume a signal centred on zero. True for a "
+                                "z-score, not for `raw`.")
+    tail_side = SIDE_LABEL[side_label]
+    with tc_:
+        tail_z = st.slider(f"Outlier threshold ({unit})", lo, hi, default, step,
+                           help=f"Measured in {unit} because the transform is "
+                                f"`{tkind}`, so the cut is comparable only "
+                                "within one transform.")
+
+    # `raw` is not centred on zero - Naver's index runs 0-100 - so a symmetric
+    # cut selects nothing or everything. Say so rather than showing an empty test.
+    if tkind == "raw" and tail_side != "upper":
+        st.warning(
+            f"`{side_label}` compares against **-{tail_z:g}**, but the `raw` "
+            "transform is not centred on zero, so that cut is meaningless here. "
+            "Switch the transform to a z-score, or use High only.", icon="⚠️")
 
     tail = stats.tail_test(tl["signal"], tl["fwd"], maxlags=horizon,
-                           threshold=tail_z)
-    tl["outlier"] = tl["signal"] > tail_z
+                           threshold=tail_z, side=tail_side)
+    tl["outlier"] = stats.tail_mask(tl["signal"], tail_z, tail_side)
     marks = tl[tl["outlier"]].assign(
         direction=lambda f: np.where(f["fwd"] >= 0, "up", "down"))
 
@@ -515,7 +532,7 @@ with tab_test:
                       "usable days. The rest form the comparison group.")
 
     ev = stats.event_metrics(tl["signal"], tl["fwd"], maxlags=horizon,
-                             threshold=tail_z)
+                             threshold=tail_z, side=tail_side)
     ec = st.columns(4)
     ec[0].metric("Mean return, event days", f"{ev['mean_event']:+.2%}",
                  help=f"{ev['n_events']:,} days above the threshold.")
@@ -580,7 +597,7 @@ with tab_test:
                    f"{min(stats.TAIL_GRID):g}–{max(stats.TAIL_GRID):g} grid is in "
                    "z units and does not fit the selected transform.")
     curve = stats.tail_curve(tl["signal"], tl["fwd"], maxlags=horizon,
-                             thresholds=grid)
+                             thresholds=grid, side=tail_side)
     st.dataframe(
         curve.rename(columns={"threshold": "cut", "excess": "excess return",
                               "t": "HAC t", "p": "HAC p",

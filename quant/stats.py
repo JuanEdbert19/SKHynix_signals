@@ -144,8 +144,32 @@ def signal_correlation(a, b):
     }
 
 
-def tail_test(sig, fwd, maxlags, threshold=TAIL_Z):
-    """Mean forward return on high-signal days versus every other day.
+SIDES = ("upper", "lower", "both")
+
+
+def tail_mask(x, threshold, side="upper"):
+    """Which days count as outliers, for a given side of the distribution.
+
+    `lower` and `both` are symmetric about zero, so they assume a signal
+    centred there. That holds for zscore and dow_zscore and does NOT hold for
+    raw: Naver's index runs 0-100, where `< -2.5` selects nothing at all. The
+    caller is responsible for not offering them on an uncentred signal.
+    """
+    if side == "upper":
+        return x > threshold
+    if side == "lower":
+        return x < -threshold
+    if side == "both":
+        return x.abs() > threshold
+    raise ValueError(f"unknown side {side!r}; expected one of {SIDES}")
+
+
+def tail_test(sig, fwd, maxlags, threshold=TAIL_Z, side="upper"):
+    """Mean forward return on outlier days versus every other day.
+
+    `side` picks which tail: "upper" for unusually high signal, "lower" for
+    unusually low, "both" for either. See tail_mask for the centring assumption
+    that lower and both rely on.
 
     Two deliberate differences from long_short, and both are why this exists:
 
@@ -158,7 +182,7 @@ def tail_test(sig, fwd, maxlags, threshold=TAIL_Z):
     n_tail + n_rest equals the n reported elsewhere.
     """
     x, y = _pair(sig, fwd)
-    dummy = (x > threshold).astype(float)
+    dummy = tail_mask(x, threshold, side).astype(float)
     n_tail = int(dummy.sum())
     if n_tail < 20 or n_tail == len(x):
         return {"excess": np.nan, "t": np.nan, "p": np.nan,
@@ -169,7 +193,7 @@ def tail_test(sig, fwd, maxlags, threshold=TAIL_Z):
             "n_tail": n_tail, "n_rest": len(x) - n_tail}
 
 
-def tail_curve(sig, fwd, maxlags, thresholds=TAIL_GRID):
+def tail_curve(sig, fwd, maxlags, thresholds=TAIL_GRID, side="upper"):
     """tail_test across a grid of cuts.
 
     Not a convenience wrapper. TAIL_Z was chosen after inspecting results, so a
@@ -177,12 +201,12 @@ def tail_curve(sig, fwd, maxlags, thresholds=TAIL_GRID):
     what lets a reader see whether the chosen cut sits on a plateau or on a
     lone spike. It is rendered unconditionally for that reason.
     """
-    rows = [{"threshold": t, **tail_test(sig, fwd, maxlags, threshold=t)}
+    rows = [{"threshold": t, **tail_test(sig, fwd, maxlags, threshold=t, side=side)}
             for t in thresholds]
     return pd.DataFrame(rows)
 
 
-def event_metrics(sig, fwd, maxlags, threshold=TAIL_Z):
+def event_metrics(sig, fwd, maxlags, threshold=TAIL_Z, side="upper"):
     """Discrete summary of outlier days, with a HAC-tested hit rate.
 
     The hit rate is measured against the MEDIAN of non-event days, not of all
@@ -198,7 +222,7 @@ def event_metrics(sig, fwd, maxlags, threshold=TAIL_Z):
     rank_ic ships without a p-value.
     """
     x, y = _pair(sig, fwd)
-    ev = x > threshold
+    ev = tail_mask(x, threshold, side)
     n_events = int(ev.sum())
     nan = {k: np.nan for k in ("mean_event", "mean_rest", "median_rest", "hit_rate",
                                "base_rate", "hit_diff", "hit_t", "hit_p", "abs_ratio")}
@@ -241,7 +265,8 @@ def reverse_causality(sig, past, maxlags=3):
     return out
 
 
-def evaluate(panel, horizon=3, target="fwd_ret", q=5, tail_z=TAIL_Z):
+def evaluate(panel, horizon=3, target="fwd_ret", q=5, tail_z=TAIL_Z,
+             tail_side="upper"):
     """The headline result for one specification.
 
     One horizon, one target, one transform — the specification is fixed before
@@ -257,8 +282,9 @@ def evaluate(panel, horizon=3, target="fwd_ret", q=5, tail_z=TAIL_Z):
     # signal_not_the_reverse inspects the call arguments instead.
     reg = ols_hac(fwd, sig, maxlags=horizon)
     ls = long_short(sig, fwd, maxlags=horizon, q=q)
-    tail = tail_test(sig, fwd, maxlags=horizon, threshold=tail_z)
-    ev = event_metrics(sig, fwd, maxlags=horizon, threshold=tail_z)
+    tail = tail_test(sig, fwd, maxlags=horizon, threshold=tail_z, side=tail_side)
+    ev = event_metrics(sig, fwd, maxlags=horizon, threshold=tail_z,
+                       side=tail_side)
     return {
         "horizon": horizon,
         "target": target,
@@ -274,6 +300,7 @@ def evaluate(panel, horizon=3, target="fwd_ret", q=5, tail_z=TAIL_Z):
         "ls_n": ls["n"],
         # Tail: one-sided, full sample. Exploratory - see TAIL_Z.
         "tail_z": tail_z,
+        "tail_side": tail_side,
         "tail_excess": tail["excess"],
         "tail_t": tail["t"],
         "tail_p": tail["p"],
