@@ -89,6 +89,46 @@ def build_panel(px, sig, transform_kind="zscore", window=20, kospi=None,
     return panel
 
 
+def trailing_pct_rank(sig, window=20):
+    """Where each value sits among the previous `window`, in [0, 1].
+
+    TRAILING is load-bearing. Ranking against the whole sample would let day t's
+    value depend on days t+1..T, so the signal would encode the future and
+    nothing downstream would reveal it - the same failure the .shift(1) in
+    transform() and the +1 day in align.py exist to prevent.
+
+    Deliberately not in TRANSFORMS: `pctrank` was cut on 2026-08-10, and putting
+    it back on the menu would reverse that decision. It exists here only to give
+    combine() a non-negative weight.
+    """
+    x = sig.astype(float)
+    # raw=True is ~10x faster and the closure only needs the values.
+    out = x.rolling(window).apply(
+        lambda w: (w[:-1] < w[-1]).mean(), raw=True
+    )
+    return out.rename(sig.name)
+
+
+def combine(attention, sentiment, window=20):
+    """Attention as a non-negative weight, sentiment as the sign.
+
+    A plain product of the two inverts on days when BOTH are negative - 8% of
+    the overlapping sample - so low attention plus bad news would score like
+    high attention plus good news. Ranking attention into [0, 1] makes the sign
+    always the sentiment's, and the magnitude a measure of how much attention
+    was on it.
+
+    The rank also caps the influence of a single day: dow_zscore reaches +50.65
+    on this data, which as a raw multiplier would swamp every other observation.
+
+    NaN wherever either input is missing. The product of a known sentiment and
+    an unknown attention is unknown, not zero.
+    """
+    weight = trailing_pct_rank(attention, window=window)
+    both = pd.concat([weight.rename("w"), sentiment.rename("s")], axis=1)
+    return (both["w"] * both["s"]).rename("combined")
+
+
 def coverage(sig, min_gap=3):
     """Where a signal actually has data, and where it does not.
 

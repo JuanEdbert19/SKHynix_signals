@@ -119,6 +119,31 @@ def long_short(sig, fwd, maxlags, q=5):
     return {"spread": res["coef"], "t": res["t"], "p": res["p"], "n": res["n"]}
 
 
+def signal_correlation(a, b):
+    """How two signals relate to each other, and on how many shared days.
+
+    The overlap is reported because it changes what the coefficient means:
+    0.9 across 40 shared days and 0.9 across 1,400 are different claims, and
+    signals here have very different coverage - GDELT news is absent on a third
+    of trading days before 2024 while Naver search is present on nearly all.
+
+    No p-value, for the same reason rank_ic has none: both series are
+    autocorrelated, so a textbook correlation p-value assumes an independence
+    that is not there.
+    """
+    x, y = _pair(a, b)
+    if len(x) < 10:
+        return {"pearson": np.nan, "spearman": np.nan, "n_overlap": len(x),
+                "n_a": int(a.notna().sum()), "n_b": int(b.notna().sum())}
+    return {
+        "pearson": float(x.corr(y)),
+        "spearman": float(x.corr(y, method="spearman")),
+        "n_overlap": len(x),
+        "n_a": int(a.notna().sum()),
+        "n_b": int(b.notna().sum()),
+    }
+
+
 def tail_test(sig, fwd, maxlags, threshold=TAIL_Z):
     """Mean forward return on high-signal days versus every other day.
 

@@ -174,7 +174,7 @@ fwd_col = f"{target}_{horizon}"
 res = stats.evaluate(pnl, horizon=horizon, target=target, q=quantiles)
 qt = stats.quantile_table(pnl["signal"], pnl[fwd_col], q=quantiles)
 
-tab_signal, tab_price = st.tabs(["Signal test", "Price"])
+tab_signal, tab_combine, tab_price = st.tabs(["Signal test", "Combine", "Price"])
 
 with tab_signal:
     st.title("Signal → forward price behaviour")
@@ -503,6 +503,138 @@ with tab_signal:
         "Inference is Newey-West HAC throughout, maxlags = horizon. "
         "**Prices** pykrx (KRX official). **β=1** assumed in the excess-return target."
     )
+
+# --- combine ----------------------------------------------------------------
+
+with tab_combine:
+    st.title("Combine two signals")
+    st.caption(
+        "Tests a different hypothesis from either signal alone: that sentiment "
+        "matters **more when people are paying attention**. Attention enters as a "
+        "trailing percentile rank in [0, 1] — a weight — and sentiment supplies "
+        "the sign, so the product is signed by the news and scaled by how much "
+        "attention was on it."
+    )
+
+    cc = st.columns(2)
+    att_name = cc[0].selectbox(
+        "Attention signal (becomes the weight)", _names,
+        index=_names.index("naver_hynix") if "naver_hynix" in _names else 0)
+    sen_name = cc[1].selectbox(
+        "Sentiment signal (supplies the sign)", _names,
+        index=_names.index("gdelt_sent_semi") if "gdelt_sent_semi" in _names else 0)
+
+    if att_name == sen_name:
+        st.warning("Pick two different signals.", icon="⚠️")
+        st.stop()
+
+    try:
+        att_raw = signals.load_signal(att_name, px, kospi)
+        sen_raw = signals.load_signal(sen_name, px, kospi)
+    except FileNotFoundError as exc:
+        st.error(f"**Missing data.**\n\n{exc}", icon="📥")
+        st.stop()
+
+    att = panel_mod.transform(
+        att_raw, kind=signals.DEFAULT_TRANSFORM.get(att_name, "zscore"),
+        window=int(window))
+    sen = panel_mod.transform(
+        sen_raw, kind=signals.DEFAULT_TRANSFORM.get(sen_name, "raw"),
+        window=int(window))
+
+    # --- how the two relate to each other ------------------------------------
+
+    corr = stats.signal_correlation(att, sen)
+    st.subheader("Correlation between the two signals")
+    kc = st.columns(4)
+    kc[0].metric("Pearson", f"{corr['pearson']:+.3f}",
+                 help="Linear. No p-value: both series are autocorrelated, so a "
+                      "textbook correlation p-value would assume independence "
+                      "that is not there.")
+    kc[1].metric("Spearman", f"{corr['spearman']:+.3f}", help="Rank-based.")
+    kc[2].metric("Overlapping days", f"{corr['n_overlap']:,}",
+                 help="The combination is only defined here. Everything else is NaN.")
+    kc[3].metric("Coverage", f"{corr['n_a']:,} / {corr['n_b']:,}",
+                 help=f"{att_name} days / {sen_name} days, before intersecting.")
+
+    if corr["n_overlap"] < 200:
+        st.warning(
+            f"Only {corr['n_overlap']:,} shared days. A correlation on this few "
+            "observations is not worth much, and the combined signal inherits the "
+            "same limit.", icon="⚠️")
+    elif abs(corr["spearman"]) > 0.7:
+        st.warning(
+            f"These signals correlate {corr['spearman']:+.2f}, so they largely "
+            "measure the same thing. A product of two near-identical series is "
+            "closer to a square than to an interaction.", icon="⚠️")
+    else:
+        st.caption(
+            f"Near-independent (Spearman {corr['spearman']:+.3f}), so the "
+            "combination is not double-counting one underlying quantity — the "
+            "interaction is the only reason to expect anything from it."
+        )
+
+    pair = pd.concat([att.rename("attention"), sen.rename("sentiment")],
+                     axis=1).dropna().reset_index()
+    pair.columns = ["date", "attention", "sentiment"]
+    sc = alt.Chart(pair).mark_circle(size=24, color=SERIES, opacity=0.4).encode(
+        x=alt.X("attention:Q", title=f"{att_name} ({signals.DEFAULT_TRANSFORM.get(att_name)})",
+                scale=alt.Scale(nice=True, zero=False)),
+        y=alt.Y("sentiment:Q", title=f"{sen_name}", scale=alt.Scale(nice=True, zero=False)),
+        tooltip=[alt.Tooltip("date:T", title="Date"),
+                 alt.Tooltip("attention:Q", format=".2f"),
+                 alt.Tooltip("sentiment:Q", format=".3f")],
+    )
+    st.altair_chart(
+        styled((sc + sc.transform_regression("attention", "sentiment")
+                .mark_line(color=ACCENT, strokeWidth=2))
+               .properties(title="The two signals against each other"), height=260),
+        width="stretch")
+
+    st.divider()
+
+    # --- the combined signal -------------------------------------------------
+
+    combo = panel_mod.combine(att, sen, window=int(window))
+    cpnl = panel_mod.build_panel(px, combo, transform_kind="raw",
+                                 window=int(window), kospi=kospi, horizon=horizon)
+    cres = stats.evaluate(cpnl, horizon=horizon, target=target, q=quantiles)
+
+    st.subheader(f"`{att_name}` × `{sen_name}` against forward returns")
+    m = st.columns(5)
+    m[0].metric("Rank IC", f"{cres['ic']:+.3f}")
+    m[1].metric("HAC t-stat", f"{cres['t_hac']:+.2f}")
+    m[2].metric("p (HAC)", f"{cres['p_hac']:.4f}",
+                delta="significant" if cres["p_hac"] < stats.ALPHA else "not significant",
+                delta_color="normal" if cres["p_hac"] < stats.ALPHA else "off")
+    m[3].metric("Top−bottom spread", f"{cres['ls_spread']:+.2%}",
+                help=f"HAC t = {cres['ls_t']:+.2f}, p = {cres['ls_p']:.4f}")
+    m[4].metric("Observations", f"{int(cres['n']):,}")
+
+    cqt = stats.quantile_table(cpnl["signal"], cpnl[f"{target}_{horizon}"], q=quantiles)
+    if not cqt.empty:
+        cqt = cqt.assign(lo=cqt["mean"] - cqt["se"], hi=cqt["mean"] + cqt["se"])
+        b = alt.Chart(cqt).encode(x=alt.X("bucket:O", title="Combined-signal quantile",
+                                          axis=alt.Axis(labelAngle=0)))
+        st.altair_chart(
+            styled((b.mark_bar(color=SERIES, cornerRadiusEnd=4, size=34).encode(
+                        y=alt.Y("mean:Q", title=f"Mean {TARGET_SHORT[target].lower()} ({horizon}d)",
+                                axis=alt.Axis(format=".2%")),
+                        tooltip=[alt.Tooltip("bucket:O"), alt.Tooltip("mean:Q", format=".4f"),
+                                 alt.Tooltip("n:Q")])
+                    + b.mark_rule(color=INK, opacity=0.55, strokeWidth=2).encode(
+                        y="lo:Q", y2="hi:Q"))
+                   .properties(title="Mean forward return by combined-signal quantile")),
+            width="stretch")
+
+    st.caption(
+        f"**Exploratory.** This is an additional test on a question already examined "
+        f"several ways, and both components read null on their own. Reproduce from the "
+        f"command line with `python scripts/run_test.py --combine "
+        f"{att_name},{sen_name} --target {target} --horizon {horizon}` — nothing here "
+        "is registered as a signal, so that command is the only record."
+    )
+
 
 # --- price ------------------------------------------------------------------
 

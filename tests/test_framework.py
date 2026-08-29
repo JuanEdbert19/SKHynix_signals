@@ -1239,3 +1239,103 @@ def test_coverage_handles_a_signal_with_no_data():
     idx = pd.bdate_range("2024-01-01", periods=10, name="date")
     cov = panel.coverage(pd.Series(np.nan, index=idx))
     assert cov["first"] is None and cov["last"] is None and cov["n_have"] == 0
+
+
+# --- combining signals -------------------------------------------------------
+
+
+def test_trailing_rank_cannot_see_the_future():
+    """THE test for this feature.
+
+    A full-sample percentile rank passes every other check here while encoding
+    tomorrow in today's value. Changing everything after t must leave the rank
+    at t untouched.
+    """
+    rng = np.random.default_rng(0)
+    idx = pd.bdate_range("2024-01-01", periods=200, name="date")
+    s = pd.Series(rng.standard_normal(200), index=idx)
+
+    base = panel.trailing_pct_rank(s, window=20)
+    tampered = s.copy()
+    tampered.iloc[120:] = 999.0                    # rewrite the entire future
+    after = panel.trailing_pct_rank(tampered, window=20)
+
+    pd.testing.assert_series_equal(base.iloc[:120], after.iloc[:120])
+
+
+def test_trailing_rank_bounds_and_warmup():
+    idx = pd.bdate_range("2024-01-01", periods=60, name="date")
+    rising = pd.Series(np.arange(60.0), index=idx)
+    falling = pd.Series(np.arange(60.0)[::-1], index=idx)
+
+    r = panel.trailing_pct_rank(rising, window=20)
+    f = panel.trailing_pct_rank(falling, window=20)
+    assert r.iloc[:19].isna().all(), "no trailing history yet"
+    assert (r.dropna() == 1.0).all(), "a rising series is always a new high"
+    assert (f.dropna() == 0.0).all(), "a falling series is always a new low"
+
+
+def test_combine_sign_always_follows_sentiment():
+    """The 110-day case that motivated the design.
+
+    A plain product makes negative x negative positive, so low attention plus
+    bad news would score like high attention plus good news.
+    """
+    idx = pd.bdate_range("2024-01-01", periods=60, name="date")
+    rng = np.random.default_rng(1)
+    att = pd.Series(rng.standard_normal(60), index=idx)
+    sen = pd.Series(rng.standard_normal(60), index=idx).clip(-1, 1)
+
+    out = panel.combine(att, sen, window=20).dropna()
+    both_neg = (att < 0) & (sen < 0)
+    assert both_neg.sum() > 0, "fixture must contain the case being tested"
+
+    # Where attention ranks above its window's floor, the sign is the
+    # sentiment's. A rank of exactly 0 zeroes the product, which is correct
+    # (no attention at all) and the only permitted exception.
+    weight = panel.trailing_pct_rank(att, window=20)[out.index]
+    nonzero = weight > 0
+    assert nonzero.sum() > 10, "fixture too degenerate to test signs"
+    assert (np.sign(out[nonzero]) == np.sign(sen[out.index][nonzero])).all()
+    assert (out[~nonzero] == 0).all()
+
+    # The specific failure the design exists to prevent.
+    checked = both_neg[out.index] & nonzero
+    assert checked.sum() > 0, "no double-negative day survived to be checked"
+    assert (out[checked] < 0).all(), "negative x negative came out positive"
+
+
+def test_combine_is_nan_where_either_input_is_missing():
+    idx = pd.bdate_range("2024-01-01", periods=60, name="date")
+    att = pd.Series(1.0, index=idx)
+    sen = pd.Series(0.5, index=idx)
+    sen.iloc[30:35] = np.nan
+
+    out = panel.combine(att, sen, window=20)
+    assert out.iloc[30:35].isna().all(), "missing sentiment must not become zero"
+
+
+def test_a_single_attention_outlier_cannot_dominate():
+    """dow_zscore reaches +50.65 on real data; a raw multiplier would swamp all."""
+    idx = pd.bdate_range("2024-01-01", periods=80, name="date")
+    rng = np.random.default_rng(2)
+    att = pd.Series(rng.standard_normal(80), index=idx)
+    att.iloc[50] = 50.65
+    sen = pd.Series(0.5, index=idx)
+
+    out = panel.combine(att, sen, window=20).dropna()
+    assert out.max() <= 0.5 + 1e-9, "rank is bounded, so the product is too"
+    assert out.iloc[out.index.get_loc(idx[50])] <= 0.5 + 1e-9
+
+
+def test_signal_correlation_uses_the_intersection():
+    idx = pd.bdate_range("2024-01-01", periods=100, name="date")
+    a = pd.Series(np.arange(100.0), index=idx)
+    b = a.copy()
+    b.iloc[:60] = np.nan                       # b only exists for 40 days
+
+    r = stats.signal_correlation(a, b)
+    assert r["n_overlap"] == 40, "must count shared days, not the union"
+    assert r["n_a"] == 100 and r["n_b"] == 40
+    assert r["pearson"] == pytest.approx(1.0)
+    assert stats.signal_correlation(b, a)["n_overlap"] == 40

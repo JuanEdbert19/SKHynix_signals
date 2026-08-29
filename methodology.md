@@ -212,6 +212,105 @@ sidebar setting rather than a fetch decision.
 Days with **zero** articles are NaN, not zero. An absent headline is an undefined sentiment,
 not a neutral one.
 
+## Combining signals
+
+**A plain product of attention and sentiment inverts on 8% of days.** Attention as
+`dow_zscore` is negative on 55% of the overlapping sample and sentiment on 14%; on **110 of
+1,420 days both are negative**, and negative × negative is positive — so *low attention plus
+bad news* would score identically to *high attention plus good news*.
+
+`panel.combine` therefore puts attention in as a **non-negative weight** and lets sentiment
+carry the sign: `trailing_pct_rank(attention) × sentiment`, with the rank in [0, 1] and
+sentiment in [−1, +1]. A second hazard disappears with it — `dow_zscore` reaches **+50.65**
+on this data, so as a raw multiplier one day would dominate the entire series; a rank cannot.
+
+**The rank is trailing, and that is load-bearing.** A percentile rank computed over the whole
+sample lets day *t*'s value depend on days *t+1…T*, which is look-ahead of exactly the kind
+`align.py` and the `.shift(1)` in `transform` exist to prevent — and it is invisible
+downstream, since the resulting signal looks entirely well-behaved. Day *t* is ranked only
+against the previous `window` observations. Pinned by
+`test_trailing_rank_cannot_see_the_future`, which rewrites the entire future and asserts the
+past is unchanged.
+
+`trailing_pct_rank` is deliberately **not** in `TRANSFORMS`. `pctrank` was removed in the
+2026-08-10 scope cut; re-registering it would reverse that decision, so it exists only inside
+`combine`.
+
+**The combination is defined on the intersection**, which is the binding constraint: 1,420
+overlapping days of 1,865, limited by GDELT's thin pre-2024 coverage, and fewer still after
+the rank's 20-day warm-up.
+
+**`signal_correlation` reports the overlap alongside the coefficient**, because the two are
+not separable: 0.9 across 40 shared days and 0.9 across 1,400 are different claims. It ships
+no p-value, for the same reason `rank_ic` does not — both series are autocorrelated.
+
+Measured for the pair the tab defaults to: `naver_hynix` × `gdelt_sent_semi` correlate
+**−0.007 Pearson, +0.013 Spearman**. Near-independent, so the product is not double-counting
+one quantity, and the interaction is the only reason to expect anything from it.
+
+## Reverse causality is mislabelled — UNRESOLVED (found 2026-08-29)
+
+**`stats.reverse_causality` does not test causal ordering, and `findings.md` and the dashboard
+both present it as though it does.** The problem is that its "past" returns are not past
+relative to when the signal's information was generated, and the offset differs per signal.
+
+`past_returns` computes `past_ret_k[t] = logc[t] − logc[t−k]`, so `past_ret_1[t]` spans
+close(t−1) → close(t). Compare that against each signal's actual information window:
+
+| Signal | Information window | vs `past_ret_1[t]` |
+|---|---|---|
+| `gdelt_sent_semi` | close(t−1) → close(t) — articles carry real UTC timestamps and go straight into `align_to_trading_days` | **identical window** — fully contemporaneous |
+| `naver_hynix` and every calendar-aggregated signal | 00:00 → 24:00 KST on day *t−1* | return window starts **after** most of the signal |
+
+For a Tuesday, Naver's signal is Monday's search, the bulk of it before Monday's 15:30 close,
+while `past_ret_1` runs Monday 15:30 → Tuesday 15:30. A positive coefficient there cannot mean
+"the return caused the attention" — the attention came first. It is closer to a near-term
+*forward* test.
+
+Measured on `naver_hynix` (2023–2026, h=1), the harness's regressor and a genuinely-prior one
+disagree and are barely related:
+
+| Regressor | corr with signal | HAC p |
+|---|---|---|
+| `past_ret_1` — what the harness uses, close(t−1)→close(t) | +0.049 | 0.103 |
+| close(t−2)→close(t−1) — actually before the search window | +0.071 | 0.222 |
+
+with a correlation of only **−0.088** between the two regressors. Different windows, different
+questions.
+
+**There is no lag shift that fixes both signals**, because the misalignment differs in kind.
+Worse, for a calendar-aggregated signal the question is not cleanly answerable at daily
+resolution at all: the price move most likely to send someone searching is *that same session's*
+move, which sits **inside** the signal's own window. A return strictly prior would have to end
+at close(t−2), by which point it is no longer the mechanism of interest.
+
+**What the feedback actually looks like.** Regressing the signal on the return realised *during*
+its own window: the **signed** move explains little (corr +0.071, p = 0.22) but the **absolute**
+move explains a great deal — **corr +0.312, HAC t = +5.40, p < 0.0001**, the strongest
+relationship measured anywhere in this project. People search after the stock moves *sharply*,
+not after it moves *up*. That asymmetry is why the momentum confound is weaker than it first
+appears: a large move in either direction does not indicate tomorrow's direction.
+
+**Proposed fix, not yet implemented.** Replace the causal framing with a joint regression,
+`fwd_ret ~ signal + recent returns`, which asks whether the signal carries information *beyond*
+recent returns rather than which came first. That is valid whatever window a signal covers, so
+it needs no per-signal reasoning about alignment. Measured on `naver_hynix` (2023–2026, h=1),
+the signal survives it:
+
+| Specification | signal coefficient | p |
+|---|---|---|
+| signal alone | +0.00238 | 0.044 |
+| + yesterday's move | +0.00252 | 0.038 |
+| + yesterday's move + 5-day trend | +0.00240 | 0.052 |
+
+The coefficient does not shrink when trend is controlled for, which is what the confound
+"uptrend causes attention, uptrend continues" would require. Both trend terms are themselves
+null (p = 0.27 and 0.91).
+
+**Until this is fixed**, read the reverse-causality panel as *"is this signal a proxy for the
+return realised up to the decision point?"* — a real and useful question — and not as evidence
+about which came first.
+
 ## Timing
 
 **A one-day lag is correct for a research claim; a tradeable claim needs more.**

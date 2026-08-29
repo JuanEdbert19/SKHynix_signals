@@ -25,7 +25,11 @@ RESULTS = ROOT / "results"
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--signal", required=True, choices=sorted(signals.SIGNALS))
+    ap.add_argument("--signal", choices=sorted(signals.SIGNALS))
+    ap.add_argument("--combine", metavar="ATTENTION,SENTIMENT",
+                    help="multiplicative combination of two registered signals: "
+                         "attention enters as a trailing percentile rank in [0,1], "
+                         "sentiment supplies the sign. Alternative to --signal.")
     ap.add_argument("--transform", default=None, choices=panel_mod.TRANSFORMS,
                     help="default is per-signal; 'zscore' for count-style signals")
     ap.add_argument("--horizon", type=int, default=panel_mod.HORIZON)
@@ -37,12 +41,37 @@ def main():
     ap.add_argument("--tail-z", type=float, default=stats.TAIL_Z, dest="tail_z",
                     help="outlier cut for the tail test, in transformed-signal units")
     args = ap.parse_args()
-
-    tkind = args.transform or signals.DEFAULT_TRANSFORM.get(args.signal, "zscore")
+    if bool(args.signal) == bool(args.combine):
+        ap.error("give exactly one of --signal or --combine")
 
     px = prices.load_prices(start=args.start, end=args.end)
     kospi = prices.load_index(start=args.start, end=args.end)
-    sig = signals.load_signal(args.signal, px, kospi)
+
+    if args.combine:
+        # The Combine tab picks its pair in the UI, so nothing is registered in
+        # SIGNALS. This flag is what keeps a combined result reproducible from
+        # the repo rather than existing only on screen.
+        parts = [s.strip() for s in args.combine.split(",")]
+        if len(parts) != 2:
+            ap.error("--combine takes exactly two signal names, comma-separated")
+        att_name, sen_name = parts
+        for n in parts:
+            if n not in signals.SIGNALS:
+                ap.error(f"unknown signal {n!r}; available: {sorted(signals.SIGNALS)}")
+        att = panel_mod.transform(
+            signals.load_signal(att_name, px, kospi),
+            kind=signals.DEFAULT_TRANSFORM.get(att_name, "zscore"),
+            window=args.window)
+        sen = panel_mod.transform(
+            signals.load_signal(sen_name, px, kospi),
+            kind=signals.DEFAULT_TRANSFORM.get(sen_name, "raw"),
+            window=args.window)
+        sig = panel_mod.combine(att, sen, window=args.window)
+        args.signal = f"combine({att_name}x{sen_name})"
+        tkind = "raw"   # the product is already bounded and stationary
+    else:
+        tkind = args.transform or signals.DEFAULT_TRANSFORM.get(args.signal, "zscore")
+        sig = signals.load_signal(args.signal, px, kospi)
 
     pnl = panel_mod.build_panel(px, sig, transform_kind=tkind, window=args.window,
                                 kospi=kospi, horizon=args.horizon)

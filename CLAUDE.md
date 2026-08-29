@@ -66,7 +66,18 @@ all reduce to one number per trading day, which is the only interface it require
 | `quant/signals.py` | Signal registry + the three validation fixtures |
 | `quant/stats.py` | Rank IC, quantile buckets, Newey-West regressions, reverse causality |
 | `scripts/run_test.py` | CLI; writes a JSON record to `results/` |
-| `app.py` | Streamlit dashboard, two tabs — a thin caller of the same functions, so it cannot drift |
+| `app.py` | Streamlit dashboard, three tabs — a thin caller of the same functions, so it cannot drift |
+
+**Combining signals.** *Combine* multiplies an attention signal by a sentiment one to test
+whether sentiment matters more when attention is high. Attention enters as
+`panel.trailing_pct_rank` in [0,1] — a weight — and sentiment supplies the sign, because a
+plain product inverts on days when both are negative (8% of the overlap). The rank is
+**trailing**: a full-sample rank would let day *t* depend on later days, which is look-ahead.
+`trailing_pct_rank` is deliberately not in `TRANSFORMS` — `pctrank` was cut on 2026-08-10 and
+re-registering it would reverse that.
+
+The pair is chosen in the UI, so nothing is registered in `SIGNALS`; `run_test.py --combine
+A,B` is what keeps a combined result reproducible from the repo. See `methodology.md`.
 
 **Dashboard tabs.** *Signal test* is the whole analysis and reproduces `run_test.py`
 exactly. *Price* is a log-axis close chart with a SK Hynix volume panel, and takes any
