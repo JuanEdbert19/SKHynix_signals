@@ -34,12 +34,22 @@ def main():
                     help="product: attention as a trailing percentile rank in "
                          "[0,1] times sentiment, which supplies the sign. "
                          "linear: z(attention) + w*z(sentiment), w signed.")
-    ap.add_argument("--combine-weight", type=float, default=0.0,
+    ap.add_argument("--att-transform", default=None, dest="att_transform",
+                    choices=panel_mod.TRANSFORMS,
+                    help="transform for the attention leg of --combine; "
+                         "default is per rule, see panel.COMBINE_DEFAULTS")
+    ap.add_argument("--sen-transform", default=None, dest="sen_transform",
+                    choices=panel_mod.TRANSFORMS,
+                    help="transform for the sentiment leg of --combine; "
+                         "default is per rule. `raw` keeps the product's sign "
+                         "meaningful, a centred one makes neg x neg positive")
+    ap.add_argument("--combine-weight", type=float, default=None,
                     dest="combine_weight",
                     help="SIGNED coefficient on sentiment for --combine-rule "
                          "linear. 0 reduces to attention alone; negative is "
                          "meaningful, the two signals were measured pointing "
-                         "opposite ways. Ignored by the product rule.")
+                         "opposite ways. Ignored by the product rule. Default "
+                         "is per rule, see panel.COMBINE_DEFAULTS.")
     ap.add_argument("--transform", default=None, choices=panel_mod.TRANSFORMS,
                     help="default is per-signal; 'zscore' for count-style signals")
     ap.add_argument("--horizon", type=int, default=panel_mod.HORIZON)
@@ -68,18 +78,21 @@ def main():
         for n in parts:
             if n not in signals.SIGNALS:
                 ap.error(f"unknown signal {n!r}; available: {sorted(signals.SIGNALS)}")
-        att = panel_mod.transform(
-            signals.load_signal(att_name, px, kospi),
-            kind=signals.DEFAULT_TRANSFORM.get(att_name, "zscore"),
-            window=args.window)
-        sen = panel_mod.transform(
-            signals.load_signal(sen_name, px, kospi),
-            kind=signals.DEFAULT_TRANSFORM.get(sen_name, "raw"),
-            window=args.window)
+        # Defaults come from the rule, not the signal: the two rules need
+        # different things from sentiment. One source of truth with the app.
+        d = panel_mod.COMBINE_DEFAULTS[args.combine_rule]
+        att_t = args.att_transform or d["attention"]
+        sen_t = args.sen_transform or d["sentiment"]
+        weight = d["weight"] if args.combine_weight is None else args.combine_weight
+        att = panel_mod.transform(signals.load_signal(att_name, px, kospi),
+                                  kind=att_t, window=args.window)
+        sen = panel_mod.transform(signals.load_signal(sen_name, px, kospi),
+                                  kind=sen_t, window=args.window)
         sig = panel_mod.combine(att, sen, window=args.window,
-                                rule=args.combine_rule, weight=args.combine_weight)
-        args.signal = (f"combine({att_name}x{sen_name},{args.combine_rule}"
-                       + (f",w={args.combine_weight:g}"
+                                rule=args.combine_rule, weight=weight)
+        args.signal = (f"combine({att_name}[{att_t}]x{sen_name}[{sen_t}],"
+                       f"{args.combine_rule}"
+                       + (f",w={weight:g}"
                           if args.combine_rule == "linear" else "") + ")")
         # Both rules already return a bounded, stationary series: the product is
         # a [0,1] rank times a z-score, and linear is a sum of z-scores.

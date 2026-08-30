@@ -109,27 +109,28 @@ def build_panel(px, sig, transform_kind="zscore", window=20, kospi=None,
     return panel
 
 
-def trailing_pct_rank(sig, window=20):
-    """Where each value sits among the previous `window`, in [0, 1].
-
-    TRAILING is load-bearing. Ranking against the whole sample would let day t's
-    value depend on days t+1..T, so the signal would encode the future and
-    nothing downstream would reveal it - the same failure the .shift(1) in
-    transform() and the +1 day in align.py exist to prevent.
-
-    Deliberately not in TRANSFORMS: `pctrank` was cut on 2026-08-10, and putting
-    it back on the menu would reverse that decision. It exists here only to give
-    combine() a non-negative weight.
-    """
-    x = sig.astype(float)
-    # raw=True is ~10x faster and the closure only needs the values.
-    out = x.rolling(window).apply(
-        lambda w: (w[:-1] < w[-1]).mean(), raw=True
-    )
-    return out.rename(sig.name)
-
-
 COMBINE_RULES = ("product", "linear")
+
+# Per-rule defaults for the two legs and the weight. They differ by rule because
+# the rules need different things from sentiment, which is the whole reason the
+# transform is picked per signal rather than per pair:
+#
+#   product  wants `raw` sentiment. With the rank gone, two centred inputs make
+#            negative x negative read positive on ~24% of days; raw sentiment is
+#            positive on 77% of them, so the sign stays meaningful. This pairing
+#            is also the only product variant that kept a testable tail
+#            (22 days above z=2.5, against 1 for a centred sentiment).
+#
+#   linear   wants `zscore` sentiment. Addition has no sign-inversion problem,
+#            and a centred arm is what makes `weight` interpretable as relative
+#            importance rather than as a shift.
+#
+# Set by the developer on 2026-08-30. Both are starting points in the UI, not
+# fixed specifications - run_test.py takes explicit flags for a recorded result.
+COMBINE_DEFAULTS = {
+    "product": {"attention": "dow_zscore", "sentiment": "raw", "weight": 0.0},
+    "linear": {"attention": "dow_zscore", "sentiment": "zscore", "weight": 1.0},
+}
 
 
 def combine(attention, sentiment, window=20, rule="product", weight=0.0):
@@ -138,13 +139,21 @@ def combine(attention, sentiment, window=20, rule="product", weight=0.0):
     Both rules return NaN wherever either input is missing. The combination of a
     known sentiment and an unknown attention is unknown, not zero.
 
-    `product` - attention as a non-negative weight, sentiment as the sign.
-      A plain product inverts when BOTH are negative (8% of the overlapping
-      sample), so low attention plus bad news would score like high attention
-      plus good news. Ranking attention into [0, 1] makes the sign always the
-      sentiment's and the magnitude a measure of how much attention was on it.
-      The rank also caps a single day's influence: dow_zscore reaches +50.65
-      here, which as a raw multiplier would swamp every other observation.
+    `product` - a plain elementwise product of the two transformed signals.
+
+      Attention used to enter as trailing_pct_rank(attention) in [0, 1] so that
+      sentiment always supplied the sign. That was removed on 2026-08-30 by the
+      developer's call, having measured what the rank was costing: it flattened
+      attention's kurtosis from 49 to -1 and left the product with ONE day above
+      z=2.5 on 2023+, so the tail test could not run at all. Without it the
+      product keeps attention's fat tail (22 such days).
+
+      Two consequences the rank existed to prevent are now live, and are the
+      price of that. Negative x negative reads positive, on ~24% of days with
+      two centred inputs, so "low attention plus bad news" scores like "high
+      attention plus good news" - choose a `raw` sentiment transform if the sign
+      should stay meaningful. And one day can dominate: dow_zscore reaches
+      +38.9, giving a single observation ~82x the median magnitude.
 
     `linear` - z(attention) + weight * z(sentiment), `weight` SIGNED.
       The sign matters because the two signals were measured pointing opposite
@@ -153,28 +162,49 @@ def combine(attention, sentiment, window=20, rule="product", weight=0.0):
       which is what the product cannot express and this can. weight = 0 reduces
       exactly to attention alone, which is what makes a weight sweep readable.
 
-      Standardising both first is load-bearing: dow_zscore attention and zscore
-      sentiment have very different scales, so an unstandardised sum would be
-      attention plus a rounding error. It reuses transform(kind="zscore"), whose
-      .shift(1) matters here too - a day inside its own baseline pulls the mean
-      toward itself, attenuating exactly the outliers the tail test measures.
+      Each arm is put on a common scale by _unit_scale first, or `weight` would
+      not mean what it says: the transforms produce very different spreads, and
+      dow_zscore leaves attention around sd 3.2 against a zscore's 1.1.
 
     Known limitation, measured rather than assumed: attention's effect lives in
     a fat tail (kurtosis 9.9) and sentiment is near-Gaussian (0.4), so ANY
     blending thins the tail the effect depends on - a 50/50 linear mix left 5
     outlier days above z=2.5 where attention alone had 26. See methodology.md.
+
+    Neither rule transforms its inputs. Both arrive already transformed by the
+    caller, which is what makes the per-signal transform pickers meaningful -
+    and is why an earlier version standardising them here was double-counting.
     """
     if rule not in COMBINE_RULES:
         raise ValueError(f"unknown rule {rule!r}; expected one of {COMBINE_RULES}")
 
     if rule == "product":
-        w = trailing_pct_rank(attention, window=window)
-        both = pd.concat([w.rename("w"), sentiment.rename("s")], axis=1)
-        return (both["w"] * both["s"]).rename("combined")
+        both = pd.concat([attention.rename("a"), sentiment.rename("s")], axis=1)
+        return (both["a"] * both["s"]).rename("combined")
 
-    both = pd.concat([transform(attention, "zscore", window).rename("a"),
-                      transform(sentiment, "zscore", window).rename("s")], axis=1)
+    both = pd.concat([_unit_scale(attention).rename("a"),
+                      _unit_scale(sentiment).rename("s")], axis=1)
     return (both["a"] + weight * both["s"]).rename("combined")
+
+
+def _unit_scale(sig):
+    """Rescale to ~unit variance using history only.
+
+    Both inputs arrive already transformed by their registered DEFAULT_TRANSFORM,
+    so running a rolling zscore here standardises them TWICE - which it did:
+    sentiment was z-scored by the caller and again inside combine. What `weight`
+    needs is not a second abnormality measure but a common SCALE, because
+    dow_zscore leaves attention at sd ~3.2 against sentiment's ~1.1. Under the
+    old code the two arms still ended up at sd 1.89 and 1.18, so a slider set to
+    0.50 gave sentiment an effective weight of 0.31.
+
+    Expanding rather than a whole-sample std: a global constant would peek at
+    the full sample. It only changes units and never the ordering within a day,
+    but the .shift(1) in transform exists for exactly this reason, and this is
+    not the place to start an exception.
+    """
+    sd = sig.expanding(min_periods=MIN_BASELINE).std()
+    return sig / sd.replace(0.0, np.nan)
 
 
 def describe(sig):

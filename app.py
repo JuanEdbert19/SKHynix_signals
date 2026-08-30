@@ -128,6 +128,7 @@ source = st.sidebar.radio(
          "series. How they are folded is the Rule control below.")
 
 combine_rule, combine_weight = "product", 0.0
+att_t = sen_t = None
 if source == "Single":
     sig_name = _pick("Signal", "naver_hynix", "sig_one")
     att_name = sen_name = None
@@ -135,17 +136,34 @@ if source == "Single":
 else:
     att_name = _pick("Attention", "naver_hynix", "sig_att")
     sen_name = _pick("Sentiment", "gdelt_sent_semi", "sig_sen")
+    # Rule first: the two rules want different things from sentiment, so the
+    # transform defaults below depend on it. See panel_mod.COMBINE_DEFAULTS.
     combine_rule = st.sidebar.radio(
         "Rule", panel_mod.COMBINE_RULES, horizontal=True,
-        help="product: attention as a trailing percentile rank in [0,1] times "
-             "sentiment, which supplies the sign. linear: z(attention) + w × "
-             "z(sentiment), with w signed.")
+        help="product: the two transformed signals multiplied. With two centred "
+             "transforms, negative × negative reads positive — hence the `raw` "
+             "sentiment default. "
+             "linear: attention + w × sentiment, each scaled to unit variance, "
+             "w signed.")
+    _d = panel_mod.COMBINE_DEFAULTS[combine_rule]
+    # Keys are per rule so switching rules adopts that rule's defaults instead
+    # of silently carrying the previous rule's selection across.
+    att_t = st.sidebar.selectbox(
+        "Attention transform", panel_mod.TRANSFORMS,
+        index=panel_mod.TRANSFORMS.index(_d["attention"]),
+        key=f"att_t_{combine_rule}")
+    sen_t = st.sidebar.selectbox(
+        "Sentiment transform", panel_mod.TRANSFORMS,
+        index=panel_mod.TRANSFORMS.index(_d["sentiment"]),
+        key=f"sen_t_{combine_rule}")
     if combine_rule == "linear":
         # Signed, and the negative half is the point: on their own top-25 days
         # attention ran +0.94% and sentiment -0.97%, so a non-negative weight
         # makes them cancel. w=0 is attention alone, which anchors the sweep.
+        # Range is +/-2 rather than +/-1 so the default does not sit on an
+        # endpoint, which would only allow moving one way.
         combine_weight = st.sidebar.slider(
-            "Weight on sentiment", -1.0, 1.0, 0.0, 0.05,
+            "Weight on sentiment", -2.0, 2.0, _d["weight"], 0.05,
             help="Signed. 0 reduces to attention alone. Negative is meaningful "
                  "— the two signals were measured pointing opposite ways.")
     sig_name = f"{att_name} × {sen_name}"
@@ -206,14 +224,10 @@ try:
         # Each component gets its own registered transform first, then combine
         # folds them by the selected rule. Identical to what
         # `run_test.py --combine` does, so the two agree by construction.
-        att = panel_mod.transform(
-            signals.load_signal(att_name, px, kospi),
-            kind=signals.DEFAULT_TRANSFORM.get(att_name, "zscore"),
-            window=int(window))
-        sen = panel_mod.transform(
-            signals.load_signal(sen_name, px, kospi),
-            kind=signals.DEFAULT_TRANSFORM.get(sen_name, "raw"),
-            window=int(window))
+        att = panel_mod.transform(signals.load_signal(att_name, px, kospi),
+                                  kind=att_t, window=int(window))
+        sen = panel_mod.transform(signals.load_signal(sen_name, px, kospi),
+                                  kind=sen_t, window=int(window))
         sig = panel_mod.combine(att, sen, window=int(window),
                                 rule=combine_rule, weight=combine_weight)
 except FileNotFoundError as exc:
@@ -373,107 +387,21 @@ with tab_describe:
 # --- test: does it predict returns ------------------------------------------
 
 with tab_test:
-    st.title("Signal → forward price behaviour")
+    st.title("Signal performance")
     st.caption(
         f"SK Hynix 000660 · signal `{sig_name}` · transform `{tkind}` · "
         f"target `{target}` · horizon {horizon}d"
     )
 
-    # --- headline ----------------------------------------------------------
+    # --- spike test (leads: these signals are fat-tailed) -------------------
 
-    c = st.columns(5)
-    c[0].metric("Rank IC", f"{res['ic']:+.3f}", help="Spearman. Descriptive only — no p-value, because overlapping returns violate its independence assumption.")
-    c[1].metric("HAC t-stat", f"{res['t_hac']:+.2f}", help=f"Newey-West, maxlags={horizon}. The only inference path in the project.")
-    c[2].metric("p (HAC)", f"{res['p_hac']:.4f}",
-                delta="significant" if res["p_hac"] < stats.ALPHA else "not significant",
-                delta_color="normal" if res["p_hac"] < stats.ALPHA else "off")
-    c[3].metric("Top−bottom spread", f"{res['ls_spread']:+.2%}",
-                help=f"Extreme buckets only — HAC t = {res['ls_t']:+.2f}, "
-                     f"p = {res['ls_p']:.4f}, n = {int(res['ls_n']):,}. "
-                     f"This is a different sample from the {int(res['n']):,} "
-                     "observations shown at right.")
-    c[4].metric("Observations", f"{int(res['n']):,}")
-
-    if res["p_hac"] >= stats.ALPHA:
-        st.info(
-            f"No significant relationship at h={horizon} (p = {res['p_hac']:.4f}). "
-            "A null result is a valid outcome."
-        )
-
-    st.divider()
-
-    # --- quantiles + scatter -----------------------------------------------
-
-    left, right = st.columns(2)
-
-    with left:
-        if qt.empty:
-            st.warning("Not enough observations for quantile buckets.")
-        else:
-            qt = qt.assign(lo=qt["mean"] - qt["se"], hi=qt["mean"] + qt["se"])
-            base = alt.Chart(qt).encode(
-                x=alt.X("bucket:O", title="Signal quantile (1 = lowest)",
-                        axis=alt.Axis(labelAngle=0)),
-            )
-            bars = base.mark_bar(color=SERIES, cornerRadiusEnd=4, size=34).encode(
-                y=alt.Y("mean:Q",
-                        title=f"Mean {TARGET_SHORT[target].lower()} ({horizon}d)",
-                        axis=alt.Axis(format=".2%")),
-                tooltip=[alt.Tooltip("bucket:O", title="Quantile"),
-                         alt.Tooltip("mean:Q", title="Mean", format=".4f"),
-                         alt.Tooltip("se:Q", title="Std error", format=".4f"),
-                         alt.Tooltip("n:Q", title="Days")],
-            )
-            err = base.mark_rule(color=INK, opacity=0.55, strokeWidth=2).encode(
-                y="lo:Q", y2="hi:Q"
-            )
-            st.altair_chart(
-                styled((bars + err).properties(
-                    title="Mean forward return by signal quantile"
-                )),
-                width="stretch",
-            )
-            st.caption(
-                "Monotonic progression across buckets is stronger evidence than a large "
-                "end-to-end spread, which one outlier bucket can produce alone. "
-                "Bars show ±1 standard error."
-            )
-
-    with right:
-        pts = pnl[["signal", fwd_col]].dropna().reset_index()
-        pts.columns = ["date", "signal", "fwd"]
-        sc = alt.Chart(pts).mark_circle(size=26, color=SERIES, opacity=0.45).encode(
-            x=alt.X("signal:Q", title=f"Signal ({tkind})",
-                    axis=alt.Axis(tickCount=8), scale=alt.Scale(nice=True, zero=False)),
-            y=alt.Y("fwd:Q", title=f"{TARGET_SHORT[target]} ({horizon}d)",
-                    axis=alt.Axis(format=".1%")),
-            tooltip=[alt.Tooltip("date:T", title="Date"),
-                     alt.Tooltip("signal:Q", format=".3f"),
-                     alt.Tooltip("fwd:Q", title="Forward", format=".4f")],
-        )
-        fit = sc.transform_regression("signal", "fwd").mark_line(
-            color=ACCENT, strokeWidth=2
-        )
-        st.altair_chart(
-            styled((sc + fit).properties(title="Signal vs forward return, with fit")),
-            width="stretch",
-        )
-        st.caption(
-            "Check whether the fitted line is carried by the bulk of the sample or by a "
-            "handful of extreme days at the edges."
-        )
-
-    st.divider()
-
-    # --- tail (outlier) test -------------------------------------------------
-
-    st.subheader("Tail test — do outlier days behave differently?")
+    st.subheader("Signal spike test")
     st.caption(
-        "Rank IC, the HAC fit and the quantile spread all measure a relationship "
-        "across the whole distribution, so an effect confined to spikes is diluted "
-        "by the ordinary days around it. This asks a narrower question: over the "
-        f"{horizon}-day window after a day above the threshold, is the mean return "
-        "different from every other day?"
+        "**The primary test for these signals.** Over the "
+        f"{horizon}-day window after a day beyond the threshold, is the mean "
+        "return different from every other day? A spike is an *event*, so quiet "
+        "days are its absence rather than its opposite — the comparison is "
+        "tail vs everything, on the full sample, not top quantile vs bottom."
     )
 
     tl = pnl[["signal", fwd_col]].dropna().reset_index()
@@ -631,6 +559,100 @@ with tab_test:
         "significant row, and either way this is exploratory until tested on data "
         "the threshold was not chosen on."
     )
+
+    st.divider()
+
+    # --- monotonic relationship (whole distribution) ------------------------
+
+    st.subheader("Monotonic relationship test")
+    st.caption(
+        "Does the relationship hold across the *whole* distribution, not only at "
+        "the extremes? Secondary here, and deliberately so: when an effect is "
+        "confined to spikes these measures dilute it with the ordinary days "
+        "around it, and rank IC is immune to outliers by construction — it "
+        "cannot see a tail effect at all. A signal strong here **and** above is "
+        "on firmer ground than one strong in only one of them."
+    )
+
+    c = st.columns(5)
+    c[0].metric("Rank IC", f"{res['ic']:+.3f}", help="Spearman. Descriptive only — no p-value, because overlapping returns violate its independence assumption.")
+    c[1].metric("HAC t-stat", f"{res['t_hac']:+.2f}", help=f"Newey-West, maxlags={horizon}. The only inference path in the project.")
+    c[2].metric("p (HAC)", f"{res['p_hac']:.4f}",
+                delta="significant" if res["p_hac"] < stats.ALPHA else "not significant",
+                delta_color="normal" if res["p_hac"] < stats.ALPHA else "off")
+    c[3].metric("Top−bottom spread", f"{res['ls_spread']:+.2%}",
+                help=f"Extreme buckets only — HAC t = {res['ls_t']:+.2f}, "
+                     f"p = {res['ls_p']:.4f}, n = {int(res['ls_n']):,}. "
+                     f"This is a different sample from the {int(res['n']):,} "
+                     "observations shown at right.")
+    c[4].metric("Observations", f"{int(res['n']):,}")
+
+    if res["p_hac"] >= stats.ALPHA:
+        st.info(
+            f"No significant relationship at h={horizon} (p = {res['p_hac']:.4f}). "
+            "A null result is a valid outcome."
+        )
+
+    # --- quantiles + scatter -----------------------------------------------
+
+    left, right = st.columns(2)
+
+    with left:
+        if qt.empty:
+            st.warning("Not enough observations for quantile buckets.")
+        else:
+            qt = qt.assign(lo=qt["mean"] - qt["se"], hi=qt["mean"] + qt["se"])
+            base = alt.Chart(qt).encode(
+                x=alt.X("bucket:O", title="Signal quantile (1 = lowest)",
+                        axis=alt.Axis(labelAngle=0)),
+            )
+            bars = base.mark_bar(color=SERIES, cornerRadiusEnd=4, size=34).encode(
+                y=alt.Y("mean:Q",
+                        title=f"Mean {TARGET_SHORT[target].lower()} ({horizon}d)",
+                        axis=alt.Axis(format=".2%")),
+                tooltip=[alt.Tooltip("bucket:O", title="Quantile"),
+                         alt.Tooltip("mean:Q", title="Mean", format=".4f"),
+                         alt.Tooltip("se:Q", title="Std error", format=".4f"),
+                         alt.Tooltip("n:Q", title="Days")],
+            )
+            err = base.mark_rule(color=INK, opacity=0.55, strokeWidth=2).encode(
+                y="lo:Q", y2="hi:Q"
+            )
+            st.altair_chart(
+                styled((bars + err).properties(
+                    title="Mean forward return by signal quantile"
+                )),
+                width="stretch",
+            )
+            st.caption(
+                "Monotonic progression across buckets is stronger evidence than a large "
+                "end-to-end spread, which one outlier bucket can produce alone. "
+                "Bars show ±1 standard error."
+            )
+
+    with right:
+        pts = pnl[["signal", fwd_col]].dropna().reset_index()
+        pts.columns = ["date", "signal", "fwd"]
+        sc = alt.Chart(pts).mark_circle(size=26, color=SERIES, opacity=0.45).encode(
+            x=alt.X("signal:Q", title=f"Signal ({tkind})",
+                    axis=alt.Axis(tickCount=8), scale=alt.Scale(nice=True, zero=False)),
+            y=alt.Y("fwd:Q", title=f"{TARGET_SHORT[target]} ({horizon}d)",
+                    axis=alt.Axis(format=".1%")),
+            tooltip=[alt.Tooltip("date:T", title="Date"),
+                     alt.Tooltip("signal:Q", format=".3f"),
+                     alt.Tooltip("fwd:Q", title="Forward", format=".4f")],
+        )
+        fit = sc.transform_regression("signal", "fwd").mark_line(
+            color=ACCENT, strokeWidth=2
+        )
+        st.altair_chart(
+            styled((sc + fit).properties(title="Signal vs forward return, with fit")),
+            width="stretch",
+        )
+        st.caption(
+            "Check whether the fitted line is carried by the bulk of the sample or by a "
+            "handful of extreme days at the edges."
+        )
 
     st.divider()
 

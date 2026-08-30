@@ -72,26 +72,58 @@ all reduce to one number per trading day, which is the only interface it require
 **Dashboard.** Three tabs, each answering one question. *Signal* describes what the thing
 is — coverage and gaps, the series over time, its distribution (sd, skew, kurtosis, extremes)
 and its correlation with any other signal. No forward returns appear there, deliberately: a
-signal should be judged trustworthy before it is judged useful. *Test* is the whole analysis —
-headline metrics, quantiles, scatter, tail test, reverse causality. *Price* is the log-axis
+signal should be judged trustworthy before it is judged useful. *Price* is the log-axis
 close chart with overlays.
+
+*Test* runs two named tests, in this order, then reverse causality and the sample footer:
+
+1. **Signal spike test** — the outlier-day event test, and the tab's focal point. Leads
+   because these signals are fat-tailed: `naver_hynix` has kurtosis 49.5 and 12.4% of days
+   beyond z=2.5 against 0.6% for a normal, so the effect lives in the tail. Threshold and
+   tail-side controls, event metrics, the marked signal-over-time chart, and the sensitivity
+   grid all live here.
+2. **Monotonic relationship test** — rank IC, the HAC fit, the top-minus-bottom spread, the
+   quantile chart and the scatter. Secondary by construction: it is diluted by ordinary days
+   when the effect is confined to spikes, and rank IC is outlier-immune, so it cannot see a
+   tail effect at all. Ordering it second is deliberate and is pinned by
+   `test_spike_test_leads_the_test_tab`.
+
+The "no significant relationship" notice belongs to test 2 — it reports `p_hac` — and is
+rendered inside that section rather than at the top of the tab.
 
 **Signal construction lives in the sidebar, not in a tab.** The Source toggle picks a single
 registered signal or a *combined* one, and a **Rule** control picks how the pair is folded —
 `panel.COMBINE_RULES`:
 
-- `product` — `trailing_pct_rank(attention) × sentiment`, attention in [0,1] as a
-  non-negative weight and sentiment supplying the sign, because a plain product inverts when
-  both are negative.
-- `linear` — `z(attention) + w · z(sentiment)`, with **w signed** and exposed as a slider.
-  `w = 0` is attention alone. Both inputs are standardised first because the two transforms
-  are on different scales.
+- `product` — the two transformed signals multiplied, nothing else.
+- `linear` — `attention + w · sentiment`, each arm put on a common scale by
+  `panel._unit_scale` (an expanding, history-only sd), with **w signed** and exposed as a
+  slider. `w = 0` is attention alone.
+
+**Neither rule transforms its inputs.** Each leg is transformed by the caller, and the
+transform is picked **per signal** — `Attention transform` / `Sentiment transform` in the
+sidebar, `--att-transform` / `--sen-transform` on the CLI.
+
+Defaults come from **`panel.COMBINE_DEFAULTS`, keyed by rule**, not from the signals'
+`DEFAULT_TRANSFORM`, because the two rules need different things from sentiment. `app.py` and
+`run_test.py` both read that one table, so they cannot drift:
+
+| rule | attention | sentiment | weight |
+|---|---|---|---|
+| `product` | `dow_zscore` | `raw` | — |
+| `linear` | `dow_zscore` | `zscore` | 1.0 |
+
+`raw` sentiment for the product is load-bearing: with two centred transforms negative ×
+negative reads positive, and raw sentiment is the only pairing that kept a testable tail.
 
 Either branch produces one `sig`, so there is a single analysis path and nothing is rendered
 twice. This replaced a Combine tab that re-implemented a subset of the Test tab's output.
 
-`trailing_pct_rank` is deliberately not in `TRANSFORMS` — `pctrank` was cut on 2026-08-10 and
-re-registering it would reverse that. The combined pair is not registered in `SIGNALS`;
+`trailing_pct_rank` was **removed on 2026-08-30** (developer's call). It had bounded the
+product's magnitude and guaranteed sentiment supplied the sign, but it flattened attention's
+kurtosis from 49 to −1 and left the product with one day above z=2.5 on 2023+, so the tail
+test could not run. Both costs of removing it are pinned by tests. The combined pair is not
+registered in `SIGNALS`;
 `run_test.py --combine A,B --combine-rule R --combine-weight W` is what keeps a combined
 result reproducible. See `methodology.md`.
 

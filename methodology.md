@@ -346,6 +346,51 @@ Anything comparing combination rules must be judged on the tail test.
 distribution, so a fixed `z > 2.5` compares 26 days against 5 — a power difference, not a
 result. Comparisons use the top-*k* days instead.
 
+### The rank was removed on 2026-08-30
+
+Both of the product's design choices were first evaluated on properties alone (below), which
+said keep them. The developer then asked for them to be tested against returns as well, and
+the outlier test at equal event counts changed the picture — the property table had measured
+what the rank *protected against* but not what it *cost*:
+
+| variant | k=25 | k=50 | k=100 | days above z=2.5 |
+|---|---|---|---|---|
+| `rank(att) × z(sen)` | −0.59% | +0.26% | +0.05% | **1** |
+| `z(att) × raw(sen)` | +1.40% | +0.82% | +0.42% | 22 |
+| attention alone | +1.21% | +1.20% | +1.12% | 106 |
+
+The rank flattened attention's kurtosis from 49 to −1, leaving **one** day above z=2.5 — the
+product could not be tail-tested at all, which for this project is the test that matters.
+`trailing_pct_rank` was therefore deleted and the product is now a plain multiplication.
+
+The two protections it provided are gone and are pinned by tests rather than prose:
+sign inversion on ~24% of days with two centred inputs, and a single day at ~50× the typical
+magnitude. The per-signal transform pickers are the escape hatch — `raw` sentiment keeps the
+sign meaningful.
+
+**No combination beat attention alone.** On the identical 705 days, attention holds ~+1.2%
+across every k while the best product decays +1.40% → +0.42%, and their top-25 days overlap
+on 12 of 25. This was 8 further specifications on the 2023–2026 sample, run at the
+developer's explicit request with the multiple-comparison cost acknowledged.
+
+### The property table that preceded it
+
+Both were re-examined on 2026-08-30. Dropping the rank, and feeding raw rather than
+centred sentiment, were each evaluated on the signal alone - no forward returns - so the
+choice could not be made by whichever scored better:
+
+| | sign inversion | one-day dominance | share of days sentiment reads positive |
+|---|---|---|---|
+| **rank(att) x z(sen)** — kept | **0.0%** | **16.5x** median | **53.9%** |
+| z(att) x z(sen) | 23.8% | 82.3x | 53.9% |
+| rank(att) x raw sen | 0.0% | 8.5x | 77.1% |
+| z(att) x raw sen | 12.1% | 34.2x | 77.1% |
+
+Dropping the rank reintroduces sign inversion on 24% of days and lets one day run 82x the
+median. Raw sentiment is positive on 77% of days, so it cannot supply a sign at all - the
+centring is not an inconvenience to route around, it is what makes the product's premise
+true. Both alternatives fail on construction, so neither needed a return test.
+
 ### The linear rule, and why its weight is signed
 
 `combine(rule="linear")` is `z(attention) + w · z(sentiment)` with **w signed**. Both inputs
@@ -368,6 +413,13 @@ filtered, `zscore`-centred sentiment (h=1, 2023+, `fwd_exret`, top-*k* equal cou
 | **0.0** | **+0.0839** | **+1.22%** | 33 |
 | +0.5 | +0.0763 | +0.96% | 31 |
 | +1.0 | +0.0592 | +0.92% | 38 |
+
+**A scaling defect, found and fixed 2026-08-30.** `combine` ran a rolling zscore on inputs
+the caller had already transformed, so sentiment was standardised twice and the two arms
+still finished at sd 1.89 and 1.18 - a slider set to 0.50 gave sentiment an effective weight
+of 0.31. `panel._unit_scale` now divides each arm once by its **expanding** standard
+deviation: one scaling, a common scale, and history only, since a whole-sample constant
+would be the repo's only look-ahead exception.
 
 The optimum is at **zero weight on sentiment** in both directions. The earlier negative-weight
 result was an artifact of the ad-hoc 60-day centring used while diagnosing, and is recorded

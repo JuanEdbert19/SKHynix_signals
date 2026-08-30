@@ -1244,67 +1244,6 @@ def test_coverage_handles_a_signal_with_no_data():
 # --- combining signals -------------------------------------------------------
 
 
-def test_trailing_rank_cannot_see_the_future():
-    """THE test for this feature.
-
-    A full-sample percentile rank passes every other check here while encoding
-    tomorrow in today's value. Changing everything after t must leave the rank
-    at t untouched.
-    """
-    rng = np.random.default_rng(0)
-    idx = pd.bdate_range("2024-01-01", periods=200, name="date")
-    s = pd.Series(rng.standard_normal(200), index=idx)
-
-    base = panel.trailing_pct_rank(s, window=20)
-    tampered = s.copy()
-    tampered.iloc[120:] = 999.0                    # rewrite the entire future
-    after = panel.trailing_pct_rank(tampered, window=20)
-
-    pd.testing.assert_series_equal(base.iloc[:120], after.iloc[:120])
-
-
-def test_trailing_rank_bounds_and_warmup():
-    idx = pd.bdate_range("2024-01-01", periods=60, name="date")
-    rising = pd.Series(np.arange(60.0), index=idx)
-    falling = pd.Series(np.arange(60.0)[::-1], index=idx)
-
-    r = panel.trailing_pct_rank(rising, window=20)
-    f = panel.trailing_pct_rank(falling, window=20)
-    assert r.iloc[:19].isna().all(), "no trailing history yet"
-    assert (r.dropna() == 1.0).all(), "a rising series is always a new high"
-    assert (f.dropna() == 0.0).all(), "a falling series is always a new low"
-
-
-def test_combine_sign_always_follows_sentiment():
-    """The 110-day case that motivated the design.
-
-    A plain product makes negative x negative positive, so low attention plus
-    bad news would score like high attention plus good news.
-    """
-    idx = pd.bdate_range("2024-01-01", periods=60, name="date")
-    rng = np.random.default_rng(1)
-    att = pd.Series(rng.standard_normal(60), index=idx)
-    sen = pd.Series(rng.standard_normal(60), index=idx).clip(-1, 1)
-
-    out = panel.combine(att, sen, window=20).dropna()
-    both_neg = (att < 0) & (sen < 0)
-    assert both_neg.sum() > 0, "fixture must contain the case being tested"
-
-    # Where attention ranks above its window's floor, the sign is the
-    # sentiment's. A rank of exactly 0 zeroes the product, which is correct
-    # (no attention at all) and the only permitted exception.
-    weight = panel.trailing_pct_rank(att, window=20)[out.index]
-    nonzero = weight > 0
-    assert nonzero.sum() > 10, "fixture too degenerate to test signs"
-    assert (np.sign(out[nonzero]) == np.sign(sen[out.index][nonzero])).all()
-    assert (out[~nonzero] == 0).all()
-
-    # The specific failure the design exists to prevent.
-    checked = both_neg[out.index] & nonzero
-    assert checked.sum() > 0, "no double-negative day survived to be checked"
-    assert (out[checked] < 0).all(), "negative x negative came out positive"
-
-
 def test_combine_is_nan_where_either_input_is_missing():
     idx = pd.bdate_range("2024-01-01", periods=60, name="date")
     att = pd.Series(1.0, index=idx)
@@ -1315,8 +1254,19 @@ def test_combine_is_nan_where_either_input_is_missing():
     assert out.iloc[30:35].isna().all(), "missing sentiment must not become zero"
 
 
-def test_a_single_attention_outlier_cannot_dominate():
-    """dow_zscore reaches +50.65 on real data; a raw multiplier would swamp all."""
+def test_a_single_attention_outlier_now_does_dominate_the_product():
+    """The rank used to bound this. It was removed, and this is the price.
+
+    dow_zscore reaches +50.65 on real data, so with the rank gone one day
+    carries ~50x the magnitude of a typical one and drives the product on its
+    own. That was accepted knowingly on 2026-08-30 in exchange for the product
+    keeping attention's fat tail, without which the tail test had ONE event day
+    on 2023+ and could not run.
+
+    Asserted rather than merely documented so the trade-off is visible to
+    whoever reads this next, and so re-introducing any bounding shows up here
+    as a failure rather than as a silent change of behaviour.
+    """
     idx = pd.bdate_range("2024-01-01", periods=80, name="date")
     rng = np.random.default_rng(2)
     att = pd.Series(rng.standard_normal(80), index=idx)
@@ -1324,8 +1274,24 @@ def test_a_single_attention_outlier_cannot_dominate():
     sen = pd.Series(0.5, index=idx)
 
     out = panel.combine(att, sen, window=20).dropna()
-    assert out.max() <= 0.5 + 1e-9, "rank is bounded, so the product is too"
-    assert out.iloc[out.index.get_loc(idx[50])] <= 0.5 + 1e-9
+    spike = out.loc[idx[50]]
+    assert spike == pytest.approx(50.65 * 0.5), "the product is no longer bounded"
+    assert spike > 20 * out.drop(idx[50]).abs().median()
+
+
+def test_product_sign_inverts_when_both_inputs_are_negative():
+    """The other cost of dropping the rank, pinned so it cannot surprise anyone.
+
+    With two centred transforms, low attention plus bad news scores the same as
+    high attention plus good news — roughly 24% of days on the real pair. A
+    `raw` sentiment transform is the escape hatch, which is why the transform is
+    now selectable per signal rather than fixed.
+    """
+    idx = pd.bdate_range("2024-01-01", periods=40, name="date")
+    att = pd.Series(-2.0, index=idx)      # unusually LOW attention
+    sen = pd.Series(-2.0, index=idx)      # unusually BAD news
+    out = panel.combine(att, sen, window=20)
+    assert (out > 0).all(), "negative x negative must read positive — by design now"
 
 
 def test_signal_correlation_uses_the_intersection():
@@ -1516,24 +1482,64 @@ def test_min_periods_only_adds_days_and_never_changes_one():
 # --- combination rules ------------------------------------------------------
 
 
-def test_product_rule_is_unchanged():
-    """The default must reproduce the pre-existing product exactly."""
-    px = fake_px()
+def test_product_rule_is_a_plain_product():
+    """No rank, no rescaling — the inputs are multiplied as the caller gave them.
+
+    trailing_pct_rank was removed on 2026-08-30: it flattened attention's
+    kurtosis from 49 to -1 and left ONE day above z=2.5 on 2023+, so the tail
+    test could not run on the product at all. Transforming inputs is now
+    entirely the caller's job, which is what makes the per-signal transform
+    pickers mean anything.
+    """
     att = build("noise", seed=1)["signal"]
     sen = build("noise", seed=2)["signal"]
     got = panel.combine(att, sen, window=20)
-    want = panel.trailing_pct_rank(att, window=20) * sen
-    pd.testing.assert_series_equal(got, want.rename("combined"))
+    pd.testing.assert_series_equal(got, (att * sen).rename("combined"))
+    assert not hasattr(panel, "trailing_pct_rank"), "pct_rank came back"
 
 
-def test_linear_at_zero_weight_is_attention_alone():
-    """w=0 must reduce exactly to z(attention) — what makes a sweep readable."""
-    px = fake_px()
+def test_linear_at_zero_weight_ignores_sentiment_entirely():
+    """w=0 must make sentiment's VALUES irrelevant — what anchors a weight sweep.
+
+    Its availability still matters: the output is NaN wherever either input is,
+    because a combination involving an unknown is unknown. So the assertion is
+    that replacing every sentiment value leaves the result untouched, not that
+    the result equals attention on attention's own index.
+    """
     att = build("noise", seed=1)["signal"]
     sen = build("noise", seed=2)["signal"]
+    other = build("noise", seed=99)["signal"]
+
     got = panel.combine(att, sen, rule="linear", weight=0.0, window=20)
-    want = panel.transform(att, "zscore", 20)
-    pd.testing.assert_series_equal(got.dropna(), want.rename("combined").dropna())
+    same = panel.combine(att, other, rule="linear", weight=0.0, window=20)
+    pd.testing.assert_series_equal(got, same)
+    pd.testing.assert_series_equal(
+        got.dropna(), panel._unit_scale(att).rename("combined").dropna())
+
+
+def test_linear_scales_each_arm_once_not_twice():
+    """Both arms must end up on a common scale, so `weight` means what it says.
+
+    combine used to run transform(kind="zscore") on inputs the caller had
+    already transformed. Sentiment was therefore z-scored twice, and the two
+    arms still finished at sd 1.89 and 1.18 — so a slider set to 0.50 gave
+    sentiment an effective weight of 0.31.
+    """
+    px = fake_px()
+    rng = np.random.default_rng(4)
+    # Deliberately mismatched scales, as dow_zscore vs zscore are in practice.
+    att = pd.Series(rng.standard_normal(len(px)) * 3.2, index=px.index)
+    sen = pd.Series(rng.standard_normal(len(px)) * 1.1, index=px.index)
+
+    a, s = panel._unit_scale(att).dropna(), panel._unit_scale(sen).dropna()
+    assert 0.85 < s.std() / a.std() < 1.15, (
+        f"arms not on a common scale: {a.std():.3f} vs {s.std():.3f}"
+    )
+    # And the scaling must use history only — no whole-sample constant.
+    head = panel._unit_scale(att).iloc[:200]
+    att2 = att.copy()
+    att2.iloc[400:] *= 50
+    pd.testing.assert_series_equal(head, panel._unit_scale(att2).iloc[:200])
 
 
 def test_linear_weight_is_signed():
@@ -1605,3 +1611,61 @@ def test_dashboard_offers_both_combine_rules_and_agrees_with_the_library():
     weight[0].set_value(-0.5)
     at.run()
     assert not at.exception
+
+
+def test_combine_defaults_are_per_rule_and_shared_by_app_and_cli():
+    """The two rules need different things from sentiment, so defaults differ.
+
+    `product` takes `raw` sentiment: with trailing_pct_rank gone, two centred
+    inputs make negative x negative read positive, and raw sentiment is the only
+    pairing that kept a testable tail. `linear` takes `zscore`, since addition
+    has no inversion problem and a centred arm is what makes `weight` mean
+    relative importance.
+
+    Asserted against panel.COMBINE_DEFAULTS rather than duplicated, because
+    app.py and run_test.py both read it — a second copy is how they drift.
+    """
+    d = panel.COMBINE_DEFAULTS
+    assert set(d) == set(panel.COMBINE_RULES), "a rule has no defaults"
+    assert d["product"] == {"attention": "dow_zscore", "sentiment": "raw",
+                            "weight": 0.0}
+    assert d["linear"] == {"attention": "dow_zscore", "sentiment": "zscore",
+                           "weight": 1.0}
+    for rule, cfg in d.items():
+        for leg in ("attention", "sentiment"):
+            assert cfg[leg] in panel.TRANSFORMS, f"{rule}/{leg} not a transform"
+
+    src = (ROOT / "app.py").read_text()
+    assert "COMBINE_DEFAULTS[combine_rule]" in src, \
+        "the dashboard no longer reads the shared defaults"
+    cli = (ROOT / "scripts" / "run_test.py").read_text()
+    assert "COMBINE_DEFAULTS[args.combine_rule]" in cli, \
+        "the CLI no longer reads the shared defaults"
+
+
+def test_spike_test_leads_the_test_tab():
+    """The outlier test must come before the whole-distribution one.
+
+    These signals are fat-tailed — naver_hynix has kurtosis 49.5 and 12.4% of
+    days beyond z=2.5 against 0.6% for a normal — so the effect lives in the
+    tail. Rank IC is computed across all days and is immune to outliers by
+    construction, which makes it the metric LEAST able to see what is being
+    tested: on naver_hynix at h=1 the spike test reads +0.94% (p 0.035, n=106)
+    while the quantile spread reads p 0.0998.
+
+    Ordering is asserted on source position because AppTest exposes subheaders
+    as an unordered-by-section list. This is the entire point of the layout, so
+    a later edit that reorders them should fail here rather than pass quietly.
+    """
+    src = (ROOT / "app.py").read_text()
+    tab = src[src.index("with tab_test:"):src.index("with tab_price:")]
+    spike = tab.index('st.subheader("Signal spike test")')
+    mono = tab.index('st.subheader("Monotonic relationship test")')
+    rev = tab.index('st.subheader("Reverse causality")')
+    assert spike < mono < rev, "the Test tab sections are out of order"
+
+    # The null-result notice describes p_hac, which belongs to the monotonic
+    # test. Above the spike section it would announce a null for a test the
+    # reader has not reached, directly under a possibly-significant spike result.
+    null_notice = tab.index("A null result is a valid outcome")
+    assert mono < null_notice < rev, "the null notice drifted out of its section"
