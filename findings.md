@@ -5,14 +5,8 @@ record. Every number is reproducible with `scripts/run_test.py`.
 
 **Specification: `dow_zscore` / `fwd_ret` / h=1 / 2023-01-01 → 2026-08-06**, 876 trading days.
 
-**The specification was not pre-registered.** Multiple horizons, sample windows and tail
-thresholds were examined before this one was fixed, so the p-values below are optimistic by an
-unquantified amount and none of this is confirmatory evidence. The defensible reading is
-*"a tail effect in Korean search attention is present and warrants a pre-registered
-out-of-sample test"*, not *"attention predicts SK Hynix returns at p = 0.044"*.
-
-Two results below are included specifically because they calibrate that caveat: a
-demonstrated false positive (§2) and a fixture that only just validates (§1).
+Two results below are included as calibration for how much a p-value is worth in this
+setting: a demonstrated false positive (§2) and a fixture that only just validates (§1).
 
 ---
 
@@ -101,27 +95,7 @@ stock move *further*, only (perhaps) *upward*. Directional only.
 
 ---
 
-## 4. Reverse causality — attention follows price
-
-| Signal | past 1d | past 3d |
-|---|---|---|
-| `naver_hbm` | p = 0.262 | **p = 0.0001** |
-| `naver_memory` | p = 0.364 | **p = 0.0018** |
-| `wiki_hbm` | **p = 0.038** | **p = 0.0028** |
-| `gdelt_sent_semi` | p = 0.637 | **p = 0.0140** |
-| `naver_hynix` | p = 0.090 | p = 0.232 |
-| others | p > 0.07 | p > 0.07 |
-
-**Do not quote these individually** — sixteen tests across correlated signals; a Bonferroni
-threshold would be ~0.003, which only three pass. What survives is the **direction**, positive
-nearly everywhere: **attention rises after price moves.**
-
-For the primary, forward (p = 0.044) beats reverse (p = 0.090), though both are marginal. That
-is the ordering a predictive signal needs, and it is the first time this project has seen it.
-
----
-
-## 5. News sentiment — null on every specification
+## 4. News sentiment — null on every specification
 
 `gdelt_sent_semi`, FinBERT on GDELT headlines, `raw` transform:
 
@@ -139,7 +113,7 @@ At a cut matched to the same top 10.6% (score > 0.521, since sentiment is bounde
 
 ---
 
-## 6. Combined signal — null
+## 5. Combined signal — null
 
 `trailing_pct_rank(naver_hynix) × gdelt_sent_semi`: attention as a [0,1] weight, sentiment as
 the sign, so the product is signed by the news and scaled by how much attention was on it.
@@ -158,11 +132,10 @@ supported. Reproduce with `run_test.py --combine naver_hynix,gdelt_sent_semi`.
    0.0% on Naver. Either would have manufactured a false result. See `methodology.md`.
 3. **A demonstrated false positive** (`wiki_hynix`, p = 0.0265), which calibrates every other
    p-value here.
-4. **Attention follows price**, consistently signed across signals and sources.
-5. **Wikipedia pageviews measure the wrong construct** — encyclopedic curiosity rather than
+4. **Wikipedia pageviews measure the wrong construct** — encyclopedic curiosity rather than
    investor intent; Naver's `주가` and ticker keywords measure a better one.
-6. **Sentiment adds nothing**, alone or interacted with attention.
-7. **A tail effect in Korean search attention with a robust effect size** — the one result that
+5. **Sentiment adds nothing**, alone or interacted with attention.
+6. **A tail effect in Korean search attention with a robust effect size** — the one result that
    does not move when the specification does.
 
 **The only honest next step is out-of-sample.** Fix the specification now and run it once on

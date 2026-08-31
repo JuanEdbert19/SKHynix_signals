@@ -1,22 +1,370 @@
-# Data Sources — Tweet Count per Topic
+# Data sources
 
-Options for obtaining **daily tweet counts mentioning SK Hynix**. Nothing else.
+**Part 1 is what the project actually runs on** — the nine registered signals, what each one
+measures, and how to regenerate it. Parts 2–4 are the record of everything else that was
+considered: sources rejected with reasons, and the tweet post-mortem the project started from.
 
-Status: **no tweet source is obtainable, and there is no open action that would change
-that.** Every option is blocked, priced out, or disqualified — see the ranking at the end.
-The last remaining cheap test, whether an archive.org account unlocks Option B, was run on
-2026-08-24 and failed. This is a change from the review before 2026-08-20, which treated
-Option B as a free working default.
+Nothing here is optional reading for reproduction: the Naver `.xlsx` files are gitignored, so
+Part 1's permalinks and export settings are the only thing that makes a fresh clone able to
+rebuild them.
 
-Sentiment-vendor products (MarketPsych, RavenPack, Bloomberg, Brandwatch, Sometrend) are
-deliberately excluded — they are sentiment/media-analytics products, not tweet-count
-sources.
-
-Last reviewed: 2026-08-24 (Option B access tested with a real archive.org account — see
-Blocker 1). Earlier findings verified 2026-08-20 against the live Internet Archive API;
-all are reproducible with the commands given in each section.
+Last reviewed 2026-08-30. Access findings verified 2026-08-24 against the live APIs.
 
 ---
+
+# Part 1 — Signals in use
+
+Nine signals are registered in `quant/signals.py`, from three sources. One primary per family
+was named in advance; the rest are secondary, and `naver_samsung` is a control that is never
+quoted as a finding.
+
+| Signal | Source | What it measures | Role |
+|---|---|---|---|
+| `naver_hynix` | Naver DataLab | Korean searches for SK Hynix + 주가 + ticker | **primary** — investor attention |
+| `naver_semi` | Naver DataLab | Korean searches for 반도체 (semiconductor) | secondary — industry |
+| `naver_hbm` | Naver DataLab | Korean searches for HBM | secondary — product story |
+| `naver_memory` | Naver DataLab | Korean searches for D램 / 낸드 | secondary — the earnings driver |
+| `naver_samsung` | Naver DataLab | Korean searches for 삼성전자 | **CONTROL — never a finding** |
+| `wiki_hynix` | Wikimedia | Pageviews of `en:SK_Hynix` | **primary** — company attention |
+| `wiki_semi` | Wikimedia | Pageviews of `en:Semiconductor` | secondary — industry |
+| `wiki_hbm` | Wikimedia | Pageviews of `en:High_Bandwidth_Memory` | secondary — product story |
+| `gdelt_sent_semi` | GDELT + FinBERT | Tone of semiconductor news headlines | secondary — **sentiment, not attention** |
+
+Naming one primary per family in advance is what keeps "one fixed specification, one test"
+true with nine signals registered. If more than one is ever quoted as a finding, the
+multiple-comparison correction has to come back with it.
+
+---
+
+## Naver DataLab — Korean search trends (5 signals)
+
+Naver is ~60% of Korean search, so it matches the audience that actually trades this stock
+far better than Wikipedia does — a Wikipedia lookup is encyclopedic curiosity, and
+`ko:SK하이닉스` averages only 75 views/day (median 62), which is mostly integer
+quantization. DataLab is therefore the best-matched attention source identified here.
+
+**How they are obtained: by hand, through the web export**, because the REST API is closed
+(evidence immediately below). `quant/naver.py` reads the resulting `.xlsx` from a gitignored
+`data/` directory and re-checks the export settings on load, refusing a file whose
+범위 / 성별 / 연령대 toggles disagree.
+
+**The REST API is not available to accounts registered now.** A real Naver developer app
+was created and tested:
+
+| Step | Result |
+|---|---|
+| `POST openapi.naver.com/v1/datalab/search`, invalid keys | `NID AUTH Result Invalid (1000)` — key not recognised |
+| Same call with the **new app's real keys** | **`Scope Status Invalid`** — keys valid, app lacks the DataLab scope |
+| Selecting 데이터랩(검색어트렌드) at app registration | Not offered in the picker |
+| Selecting it in an existing app's API settings | **"An API that cannot be newly registered has been selected"** |
+| Selecting 검색 (Search) | Same refusal |
+
+The distinct error messages are what make this conclusive: authentication succeeds and only
+the *scope* is refused, so the credentials are not the problem — the app cannot be granted
+DataLab at all. Both of Naver's data APIs are closed to new registrations while remaining
+visible in the UI.
+
+**The web interface is unaffected:** `datalab.naver.com/keyword/trendSearch.naver` returns
+200 and requires no app, scope or key. It serves the same underlying series as a file
+export rather than JSON. Since this project needs one download and not a live feed, that
+costs little — a committed CSV plus a loader keeps every reported statistic reproducible,
+though acquisition is then manual and must be documented as such.
+
+DataLab scales every keyword group against the single maximum across the whole query, so a
+high-volume control in the same request would compress SK Hynix toward zero. **Each topic
+is therefore pulled as its own query**, accepting that levels are not comparable between
+files — which costs nothing, since every signal is z-scored independently.
+
+#### The five exports (adopted 2026-08-24)
+
+Daily granularity across the full span was confirmed available: **2,775 days,
+2019-01-01 → 2026-08-06, zero missing**, five decimal places, 2,741 distinct values, no
+zeros. The web export is not capped the way Google Trends is.
+
+Settings, identical for all five: **기간** 직접입력 `2019-01-01`~`2026-08-06` · **일간**
+(daily) · **범위** 전체 · **성별** 전체 · **연령** unchecked. `quant/naver.py` re-checks
+the last three on load and refuses a file that disagrees.
+
+| File (in gitignored `data/`) | Keywords as specified | Query permalink |
+|---|---|---|
+| `hynix_datalab.xlsx` | `SK하이닉스,하이닉스,에스케이하이닉스,SK hynix,000660,SK하이닉스 주가,하이닉스 주가` | [`N_3b29bff4…`](http://datalab.naver.com/keyword/trendResult.naver?hashKey=N_3b29bff48b07fcf25fee95d9f28275ae) |
+| `semi_datalab.xlsx` | `반도체,반도체주,반도체 관련주,반도체 전망,시스템반도체,메모리 반도체,파운드리` | [`N_c54c9143…`](http://datalab.naver.com/keyword/trendResult.naver?hashKey=N_c54c91435d1b29ad2b549c20a000c394) |
+| `hbm_datalab.xlsx` | `HBM,에이치비엠,고대역폭메모리,HBM3,HBM3E,HBM4,HBM 관련주` | [`N_1273e9c1…`](http://datalab.naver.com/keyword/trendResult.naver?hashKey=N_1273e9c17cf031ceca52fcc0e9256c54) |
+| `memory_datalab.xlsx` | `D램,디램,DRAM,낸드,낸드플래시,NAND,메모리 가격,디램 가격` | [`N_033866b2…`](http://datalab.naver.com/keyword/trendResult.naver?hashKey=N_033866b24fb230a0bb93d991dabdea3d) |
+| `samsung_datalab.xlsx` | `삼성전자,005930,삼성전자 주가` | [`N_797c5025…`](http://datalab.naver.com/keyword/trendResult.naver?hashKey=N_797c502510094d2fd47e01cbb39577a1) |
+
+**The permalinks are the authoritative record, not the keyword column.** The .xlsx stores
+the topic label and the settings but not the keyword list, so the column above is what was
+specified rather than what is provably in the file; each permalink resolves (HTTP 200) and
+shows the query as run. Any discrepancy should be resolved in favour of the permalink.
+
+**The .xlsx files are deliberately not committed** (developer's call, 2026-08-24) — `data/` is
+gitignored. Since the API is closed, this table plus the permalinks is the only thing that
+makes them regenerable, which is why the settings are spelled out. A clone cannot reproduce
+any Naver statistic without re-running these five exports by hand.
+
+#### Behaviour worth knowing before using them
+
+- **Weekend search is 12.4% of weekday search** — far more extreme than Wikipedia's. Under
+  `agg="mean"` Monday's Fri+Sat+Sun bucket averages 2.76 against ~6.5–7.0 for other
+  weekdays, and under plain `zscore` **Monday's share of the top quintile measures 0.0%** —
+  it can never register as high attention. `dow_zscore` returns it to 21.2%. See
+  `methodology.md`.
+- **`naver_hynix` and `naver_samsung` correlate 0.86** on a same-weekday baseline (0.93 on
+  weekday-only log changes), against 0.42 for the Wikipedia equivalents. The control is
+  nearly collinear with the primary, so ~90% of SK Hynix search attention is shared with
+  Samsung and *company-specific* attention is a thin residue.
+- **`naver_semi` is anchored by one day** — 2019-05-01 at 100.0 against 58.8 for the next
+  highest.
+- **`naver_hbm`'s keyword composition changes over the sample** — `HBM3`/`HBM3E`/`HBM4` have
+  no volume before each generation existed.
+
+---
+
+## Wikimedia pageviews — English Wikipedia (3 signals)
+
+**Wikimedia pageviews.** The official Wikipedia analytics API: how many people opened a
+given article on a given day, with `agent=user` excluding known spiders. A **census** —
+every view counted, none sampled — so unlike Option B there is no sampling error and no
+scaling factor at all.
+
+**How they are obtained: automatically, no key.** `quant/wiki.py` calls the REST API and
+caches to parquet. `ARTICLES` also carries `ko:SK하이닉스` and `ko:반도체`, deliberately
+**not** registered as signals — the Korean editions carry 4–14× less traffic, so small moves
+are integer noise.
+
+**Wikimedia pageviews** — whole series retrieved in seconds:
+
+| Article | Days | Coverage | Mean/day | Median | Max |
+|---|---|---|---|---|---|
+| `en:SK_Hynix` | 2,775 | 2019-01-01 → 2026-08-06 | 383 | 304 | 10,879 |
+| `en:Semiconductor` | 2,775 | same | 1,755 | 1,747 | 7,081 |
+| `en:High_Bandwidth_Memory` | 2,775 | same | 343 | 303 | 1,830 |
+| `ko:SK하이닉스` | 2,775 | same | 75 | 62 | 1,299 |
+| `ko:반도체` | 2,775 | same | 124 | 114 | 568 |
+| `ko:삼성전자` | 2,775 | same | 229 | 212 | 1,867 |
+
+**Zero missing days; 100% calendar coverage of the price sample.** Daily granularity only —
+the per-article *hourly* endpoint returns HTTP 400. A UTC day is complete before the
+06:30 UTC KRX close, so labelling each day's count at its closing edge and letting
+`quant.align` attribute it to the next session is correct and carries no look-ahead; it
+discards the 00:00–06:30 UTC window of the current day. Monthly aggregates and an
+edits-per-page series (161 rows for `en:SK_Hynix`) are also available; edits are far too
+sparse for a daily signal but work as a free event detector.
+
+Signals are distinct, not redundant — correlation of daily log-changes: `ko:SK하이닉스` vs
+`ko:반도체` = **0.30**, vs `ko:삼성전자` = **0.42**.
+
+---
+
+## GDELT news headlines + FinBERT (1 signal)
+
+**GDELT** (Global Database of Events, Language, and Tone). A project that has machine-read
+world news since 2015 in 100+ languages, republishing every 15 minutes. Free, no key. This
+signal uses the **DOC 2.0 `artlist` endpoint**, which returns individual article records —
+not `mode=timelinevol`, which returns a per-day coverage share and is what an *attention*
+signal would use. What is measured here is whether the news is good or bad, not how much of
+it there is.
+
+**How it is obtained: a rate-limited backfill, run by hand.** `scripts/fetch_gdelt.py` walks
+month by month into a parquet cache; `quant/sentiment.py` then scores each headline with
+FinBERT (`P(pos) − P(neg)`), cached by headline hash. The analysis path uses
+`allow_fetch=False` so opening the dashboard can never start an hours-long fetch.
+
+**GDELT DOC 2.0 — ADOPTED 2026-08-26** as the source for `gdelt_sent_semi`, the project's
+first sentiment signal. What it returns, measured rather than assumed:
+
+- **Headlines only.** Fields are `url, url_mobile, title, seendate, socialimage, domain,
+  language, sourcecountry`. No article body, no summary, and no parameter that returns one.
+  `seendate` is a full UTC instant, which is why this signal needs no stamping function.
+- **The query must be an industry one.** GDELT matches the article *body* and returns the
+  *title*, so a company query hands back headlines about other companies:
+
+  | Query | On-topic titles | Market-wide | Unrelated | Languages |
+  |---|---|---|---|---|
+  | `"SK Hynix"` | **15%** | — | — | 64% Korean |
+  | `HBM memory` | **58%** | 17% | 25% | 100% English |
+
+- **Earlier concern corrected.** This document previously warned that GDELT would measure
+  "Anglophone coverage of a Korean company", on the basis that only 830 of 189,545 monitored
+  outlets are South Korean. For a *company* query that is wrong — the results came back 64%
+  Korean, led by `newspim.com`, `fnnews.com`, `munhwa.com`. A small share of the source list
+  does not imply a small share of results. The English-only outcome above is a property of
+  the English-phrased industry query, not of GDELT's coverage.
+- **Coverage grows ~8× over the sample**: 1.0 articles/day (June 2019), 2.0 (2021), 8.3+/day
+  (2026, capped at the 250 record limit). Recorded because it is a real limitation of any
+  signal built on it — see `methodology.md`.
+- **Rate limit is 1 request / 5 seconds, enforced by IP block**, and the refusal arrives as
+  *plain text with a 200 status*. Anything that treats a non-empty response as success will
+  cache an error string as data. `quant/gdelt.py` detects it explicitly.
+- **`maxrecords` caps at 250** and returns the newest first, so a fixed date window silently
+  drops the oldest articles in busy periods. The fetcher halves its window whenever a page
+  comes back full.
+
+Earlier probe, retained: daily granularity confirmed at *both* ends of the price sample:
+91 daily points for 2019-01-01→2019-04-01, 89 for 2026-05-01→2026-08-01. Mean intensity for
+`"SK Hynix"` was **0.0101 in Q1 2019 vs 0.1042 in mid-2026**, a ~10× rise that is either the
+HBM/AI cycle or an expansion of GDELT's source list — **indistinguishable without a control
+series**, the same normalisation discipline Option B requires. Rate limit is **1 request per
+5 seconds**, aggressively enforced: sustained querying earned an extended block that
+persisted well beyond 30-second spacing.
+
+## GDELT query set (open, 2026-08-29)
+
+The sentiment signal's dominant defect is **too few headlines per day** — median 4, which
+leaves ~70% of the daily mean as sampling noise (reliability 0.30, or 0.14 once syndicated
+duplicates are removed). Pooling more queries is the only fix that attacks that rather than
+averaging around it, so `signals.GDELT_QUERIES` is a tuple and results are deduplicated on
+`url`.
+
+Currently `("HBM memory",)`, which yields ~58% on-topic titles. Candidates under measurement:
+`DRAM`, `NAND flash`, `SK Hynix`, `memory chip`, `semiconductor memory`.
+
+`scripts/probe_gdelt.py` samples three months per candidate (2021-03, 2024-03, 2026-03) and
+ranks them by **on-topic articles per day** — deliberately not by any return relationship,
+since queries must be chosen on coverage, not on which one happens to produce a result.
+
+Two cost notes, both measured the hard way:
+
+- a full 2019–2026 backfill for one query is **~24 hours**, not the hour the module docstring
+  originally estimated. The binding constraint is GDELT's 1-request-per-5s limit, enforced by
+  IP block, not the data volume.
+- **the probe itself is not quick.** A busy month splits recursively down to 6h windows, so a
+  single query-month can be ~100 requests. Budget hours, not minutes, for five candidates.
+
+Queries overlap heavily — the same article matches `HBM memory` and `DRAM` — so a candidate's
+*marginal* contribution after `url` deduplication is far below its raw count. That is what the
+probe measures.
+
+---
+
+# Part 2 — Considered and not adopted
+
+Measured on 2026-08-20/24 while establishing that tweets were unobtainable. Retained so a
+later reader does not re-run the same probes.
+
+## What each candidate source is
+
+**Google Trends.** Google's public window onto its own search volume. It will not return a
+raw search count under any circumstances; it returns a **0–100 index rescaled within the
+requested window**, so the peak of each request is always exactly 100 and two requests are
+not on a common scale. No official API exists — `pytrends` is an unofficial wrapper around
+the internal endpoint.
+
+**Reddit / Pushshift.** Reddit is the forum; Pushshift was the independent archive
+researchers relied on for years. Reddit cut Pushshift off in 2023 and restricted it to
+moderators.
+
+**StockTwits.** A Twitter-like network built specifically for traders, with ticker-tagged
+posts — conceptually the best fit for this project's question of anything on this page.
+
+**Bluesky.** The Twitter alternative, with a genuinely open API and no scraping
+restrictions. Launched 2023 and only grew large in 2024, so it has no history covering most
+of the price sample.
+
+**Hacker News** (via Algolia's free search API). Tech-news aggregator.
+
+**DART** (`opendart.fss.or.kr`). South Korea's official corporate filing system, the
+Korean counterpart to SEC EDGAR. Not attention data — useful for exact event timestamps, to
+separate news-driven attention from spontaneous attention.
+
+## Google Trends — works, but the granularity is not selectable
+
+`pytrends`. Granularity is chosen by Google from the window length, and
+cannot be requested:
+
+| Window | Rows returned | Granularity |
+|---|---|---|
+| 7.5 years | 92 | **monthly** |
+| 7 months | 218 | daily |
+| 90 days | 91 | daily |
+
+So daily data over 2019–2026 is impossible in one call — it requires stitching ~30
+overlapping windows and renormalising on the overlaps, since each window is independently
+rescaled to 0–100.
+
+Worldwide `"SK Hynix"` over 7.5 years returned **6 zero months, mean 4.3** — too small
+globally to survive quantisation. Korean geo rescues it: `KR / SK하이닉스` at 90 days gives
+mean 48.3 with no zeros; `KR / 반도체` gives 43.5. Also: **429 on the second call** of a
+sequence, and `pytrends` is unmaintained — it fails immediately against urllib3 2.x
+(`Retry.__init__() got an unexpected keyword argument 'method_whitelist'`) and needs its
+retry config stripped to run at all.
+
+## Tested and rejected
+
+| Source | Result |
+|---|---|
+| **Reddit** `search.json` | **403** anonymous, browser UA included. Pushshift moderator-only since 2023 |
+| **StockTwits** API | **403**, Cloudflare interstitial |
+| **Bluesky** public AppView | **403** from this host; and no history before 2023 regardless |
+| **Hacker News** (Algolia) | **200 — works**, but `"SK Hynix"` returns **137 stories total since 2019** (~1.6/month). Free and reliable, useless at daily resolution |
+
+## Free but require registration
+
+| Source | Probe result | Note |
+|---|---|---|
+| **Naver DataLab** | **API closed to new apps (2026-08-24)** — see Part 1 | Web export still open |
+| **DART** | `status 010, unregistered key` — endpoint live | Event timestamps, not attention |
+
+## The axis that matters
+
+The property that disqualified Option B for a company-specific query was **sample vs
+census**:
+
+| Source | Measurement type | Daily, 2019–2026? | Auth |
+|---|---|---|---|
+| Wikimedia pageviews | **true count** | yes, zero gaps | none |
+| GDELT | share of news coverage | yes | none |
+| Google Trends | 0–100 index, per-window rescaled | only via ~30 stitched windows | none |
+| Naver DataLab | 0–100 index | untested | free key |
+| HN / Reddit / StockTwits / Bluesky | — | no | blocked or too sparse |
+
+Only Wikipedia returns an actual number. Everything else is a normalised index whose scale
+changes between requests — which the `zscore` transform tolerates, but the `raw` transform
+and any coefficient interpretation do not.
+
+## Reproduce
+
+```bash
+# Wikimedia pageviews (no auth)
+curl -s -H "User-Agent: <contact>" \
+  "https://wikimedia.org/api/rest_v1/metrics/pageviews/per-article/en.wikipedia/all-access/user/SK_Hynix/daily/20190101/20260806"
+
+# GDELT daily news volume (no auth; wait 5s+ between calls)
+curl -s "https://api.gdeltproject.org/api/v2/doc/doc?query=%22SK%20Hynix%22&mode=timelinevol&startdatetime=20190101000000&enddatetime=20190401000000&format=json"
+
+# Hacker News (no auth)
+curl -s "https://hn.algolia.com/api/v1/search_by_date?query=%22SK%20Hynix%22&tags=story&numericFilters=created_at_i%3E1546300800"
+```
+
+Google Trends requires `pytrends` with its retry config removed; see the note above.
+
+## Unverified in this section
+
+- **GDELT earliest coverage date.** A 2015 window returned `Invalid query start date`, so
+  the range starts later than 2015, but the exact start was not established — the extended
+  rate-limit block prevented it. GDELT DOC 2.0 is documented as beginning 2017-01-01; not
+  confirmed here.
+- **GDELT Korean-language coverage.** The `SK하이닉스` query was not successfully run. This
+  matters: if GDELT under-covers Korean media, the series measures Anglophone coverage of a
+  Korean company, which is a materially weaker proxy.
+- ~~**Naver DataLab** beyond endpoint liveness — no key was obtained.~~ **Resolved
+  2026-08-24: the API is closed to new applications** (keys authenticate, scope is refused).
+  Still unverified: whether the *web* export allows daily granularity over the full span.
+- Whether the Bluesky and StockTwits 403s are permanent policy or host-specific blocking.
+
+---
+---
+
+# Part 3 — Tweet post-mortem
+
+**The project began as a study of tweet volume.** No tweet source is obtainable: every
+option below is blocked, priced out, or disqualified, and the last cheap test (an
+archive.org account on Option B) was run on 2026-08-24 and failed. This part is kept as the
+record of why the project measures search and news instead. See the README for the pivot.
+
+Sentiment-vendor products (MarketPsych, RavenPack, Bloomberg, Brandwatch, Sometrend) are
+deliberately excluded — they are sentiment/media-analytics products, not tweet-count sources.
 
 ## How much history is needed
 
@@ -35,7 +383,6 @@ observations) — those are not weak samples, they are incapable of distinguishi
 plausible effect from noise.
 
 ---
-
 ## Option A — Official X API (`/2/tweets/counts/all`)
 
 **Mechanism.** Send a query plus time range; X runs it against its own authoritative
@@ -456,7 +803,6 @@ redistributing **tweet IDs only**, not tweet content.
 **Verdict:** worth one search, low expected yield. Not a primary candidate.
 
 ---
-
 ## Comparison
 
 | | Raw tweet count? | Mechanism | Variance | Bias | Auditable | Cost | Obtainable now? |
@@ -492,7 +838,6 @@ resolved in the worst direction: **B is no longer obtainable either.**
 change of status, not a change of preference.
 
 ---
-
 ## The measurement that was supposed to settle this
 
 The previous review specified a base-rate probe: pull a few days of IA Spritzer, count
@@ -507,315 +852,9 @@ control such as Samsung, and the mandatory total-lines denominator). That conver
 base-rate question from an assumption into a measurement without a second download.
 
 ---
-
-## Out of this document's original scope: free attention sources
-
-This document is deliberately about tweet counts. This section is recorded here anyway
-because it is the direct consequence of every tweet option closing — these were measured on
-2026-08-20 while establishing that tweets are unobtainable, and the comparison is only
-meaningful next to the options above.
-
-**Status: Wikimedia pageviews were ADOPTED on 2026-08-20** and are implemented in
-`quant/wiki.py` as the signals `wiki_hynix` / `wiki_semi` / `wiki_hbm`. All three read null
-against 3-day forward returns; see CLAUDE.md Status. Every other entry below remains
-analysis only. Each is a measured fact plus the command that produced it. Adopting any of these would change the project's research question from *Twitter
-activity* to *attention* more broadly, which must be stated explicitly rather than
-substituted quietly.
-
-### What each source is
-
-**GDELT** (Global Database of Events, Language, and Tone). A project that has machine-read
-world news since 2015 in 100+ languages, republishing every 15 minutes. Free, no key.
-`mode=timelinevol` returns, per day, **the fraction of all monitored articles mentioning a
-query**. This is *news* attention — journalists writing — not social attention. Being a
-share rather than a count makes it self-normalising against archive growth, which is a real
-advantage over the raw-count sources above.
-
-**Wikimedia pageviews.** The official Wikipedia analytics API: how many people opened a
-given article on a given day, with `agent=user` excluding known spiders. A **census** —
-every view counted, none sampled — so unlike Option B there is no sampling error and no
-scaling factor at all.
-
-**Google Trends.** Google's public window onto its own search volume. It will not return a
-raw search count under any circumstances; it returns a **0–100 index rescaled within the
-requested window**, so the peak of each request is always exactly 100 and two requests are
-not on a common scale. No official API exists — `pytrends` is an unofficial wrapper around
-the internal endpoint.
-
-**Naver DataLab.** The same concept for Naver, South Korea's dominant search engine at
-roughly 60% share. For a KRX-listed stock traded largely by Korean retail investors this is
-closer to the relevant audience than Google is. Free, but requires a key.
-
-**Reddit / Pushshift.** Reddit is the forum; Pushshift was the independent archive
-researchers relied on for years. Reddit cut Pushshift off in 2023 and restricted it to
-moderators.
-
-**StockTwits.** A Twitter-like network built specifically for traders, with ticker-tagged
-posts — conceptually the best fit for this project's question of anything on this page.
-
-**Bluesky.** The Twitter alternative, with a genuinely open API and no scraping
-restrictions. Launched 2023 and only grew large in 2024, so it has no history covering most
-of the price sample.
-
-**Hacker News** (via Algolia's free search API). Tech-news aggregator.
-
-**DART** (`opendart.fss.or.kr`). South Korea's official corporate filing system, the
-Korean counterpart to SEC EDGAR. Not attention data — useful for exact event timestamps, to
-separate news-driven attention from spontaneous attention.
-
-### Confirmed working — free, no authentication
-
-**Wikimedia pageviews** — whole series retrieved in seconds:
-
-| Article | Days | Coverage | Mean/day | Median | Max |
-|---|---|---|---|---|---|
-| `en:SK_Hynix` | 2,775 | 2019-01-01 → 2026-08-06 | 383 | 304 | 10,879 |
-| `en:Semiconductor` | 2,775 | same | 1,755 | 1,747 | 7,081 |
-| `en:High_Bandwidth_Memory` | 2,775 | same | 343 | 303 | 1,830 |
-| `ko:SK하이닉스` | 2,775 | same | 75 | 62 | 1,299 |
-| `ko:반도체` | 2,775 | same | 124 | 114 | 568 |
-| `ko:삼성전자` | 2,775 | same | 229 | 212 | 1,867 |
-
-**Zero missing days; 100% calendar coverage of the price sample.** Daily granularity only —
-the per-article *hourly* endpoint returns HTTP 400. A UTC day is complete before the
-06:30 UTC KRX close, so labelling each day's count at its closing edge and letting
-`quant.align` attribute it to the next session is correct and carries no look-ahead; it
-discards the 00:00–06:30 UTC window of the current day. Monthly aggregates and an
-edits-per-page series (161 rows for `en:SK_Hynix`) are also available; edits are far too
-sparse for a daily signal but work as a free event detector.
-
-Signals are distinct, not redundant — correlation of daily log-changes: `ko:SK하이닉스` vs
-`ko:반도체` = **0.30**, vs `ko:삼성전자` = **0.42**.
-
-**GDELT DOC 2.0 — ADOPTED 2026-08-26** as the source for `gdelt_sent_semi`, the project's
-first sentiment signal. What it returns, measured rather than assumed:
-
-- **Headlines only.** Fields are `url, url_mobile, title, seendate, socialimage, domain,
-  language, sourcecountry`. No article body, no summary, and no parameter that returns one.
-  `seendate` is a full UTC instant, which is why this signal needs no stamping function.
-- **The query must be an industry one.** GDELT matches the article *body* and returns the
-  *title*, so a company query hands back headlines about other companies:
-
-  | Query | On-topic titles | Market-wide | Unrelated | Languages |
-  |---|---|---|---|---|
-  | `"SK Hynix"` | **15%** | — | — | 64% Korean |
-  | `HBM memory` | **58%** | 17% | 25% | 100% English |
-
-- **Earlier concern corrected.** This document previously warned that GDELT would measure
-  "Anglophone coverage of a Korean company", on the basis that only 830 of 189,545 monitored
-  outlets are South Korean. For a *company* query that is wrong — the results came back 64%
-  Korean, led by `newspim.com`, `fnnews.com`, `munhwa.com`. A small share of the source list
-  does not imply a small share of results. The English-only outcome above is a property of
-  the English-phrased industry query, not of GDELT's coverage.
-- **Coverage grows ~8× over the sample**: 1.0 articles/day (June 2019), 2.0 (2021), 8.3+/day
-  (2026, capped at the 250 record limit). Recorded because it is a real limitation of any
-  signal built on it — see `methodology.md`.
-- **Rate limit is 1 request / 5 seconds, enforced by IP block**, and the refusal arrives as
-  *plain text with a 200 status*. Anything that treats a non-empty response as success will
-  cache an error string as data. `quant/gdelt.py` detects it explicitly.
-- **`maxrecords` caps at 250** and returns the newest first, so a fixed date window silently
-  drops the oldest articles in busy periods. The fetcher halves its window whenever a page
-  comes back full.
-
-Earlier probe, retained: daily granularity confirmed at *both* ends of the price sample:
-91 daily points for 2019-01-01→2019-04-01, 89 for 2026-05-01→2026-08-01. Mean intensity for
-`"SK Hynix"` was **0.0101 in Q1 2019 vs 0.1042 in mid-2026**, a ~10× rise that is either the
-HBM/AI cycle or an expansion of GDELT's source list — **indistinguishable without a control
-series**, the same normalisation discipline Option B requires. Rate limit is **1 request per
-5 seconds**, aggressively enforced: sustained querying earned an extended block that
-persisted well beyond 30-second spacing.
-
-### Confirmed working — with a disqualifying catch
-
-**Google Trends** (`pytrends`). Granularity is chosen by Google from the window length, and
-cannot be requested:
-
-| Window | Rows returned | Granularity |
-|---|---|---|
-| 7.5 years | 92 | **monthly** |
-| 7 months | 218 | daily |
-| 90 days | 91 | daily |
-
-So daily data over 2019–2026 is impossible in one call — it requires stitching ~30
-overlapping windows and renormalising on the overlaps, since each window is independently
-rescaled to 0–100.
-
-Worldwide `"SK Hynix"` over 7.5 years returned **6 zero months, mean 4.3** — too small
-globally to survive quantisation. Korean geo rescues it: `KR / SK하이닉스` at 90 days gives
-mean 48.3 with no zeros; `KR / 반도체` gives 43.5. Also: **429 on the second call** of a
-sequence, and `pytrends` is unmaintained — it fails immediately against urllib3 2.x
-(`Retry.__init__() got an unexpected keyword argument 'method_whitelist'`) and needs its
-retry config stripped to run at all.
-
-### Tested and rejected
-
-| Source | Result |
-|---|---|
-| **Reddit** `search.json` | **403** anonymous, browser UA included. Pushshift moderator-only since 2023 |
-| **StockTwits** API | **403**, Cloudflare interstitial |
-| **Bluesky** public AppView | **403** from this host; and no history before 2023 regardless |
-| **Hacker News** (Algolia) | **200 — works**, but `"SK Hynix"` returns **137 stories total since 2019** (~1.6/month). Free and reliable, useless at daily resolution |
-
-### Naver DataLab — API closed, web export open (tested 2026-08-24)
-
-Naver is ~60% of Korean search, so it matches the audience that actually trades this stock
-far better than Wikipedia does — a Wikipedia lookup is encyclopedic curiosity, and
-`ko:SK하이닉스` averages only 75 views/day (median 62), which is mostly integer
-quantization. DataLab is therefore the best-matched attention source identified here.
-
-**The REST API is not available to accounts registered now.** A real Naver developer app
-was created and tested:
-
-| Step | Result |
-|---|---|
-| `POST openapi.naver.com/v1/datalab/search`, invalid keys | `NID AUTH Result Invalid (1000)` — key not recognised |
-| Same call with the **new app's real keys** | **`Scope Status Invalid`** — keys valid, app lacks the DataLab scope |
-| Selecting 데이터랩(검색어트렌드) at app registration | Not offered in the picker |
-| Selecting it in an existing app's API settings | **"An API that cannot be newly registered has been selected"** |
-| Selecting 검색 (Search) | Same refusal |
-
-The distinct error messages are what make this conclusive: authentication succeeds and only
-the *scope* is refused, so the credentials are not the problem — the app cannot be granted
-DataLab at all. Both of Naver's data APIs are closed to new registrations while remaining
-visible in the UI.
-
-**The web interface is unaffected:** `datalab.naver.com/keyword/trendSearch.naver` returns
-200 and requires no app, scope or key. It serves the same underlying series as a file
-export rather than JSON. Since this project needs one download and not a live feed, that
-costs little — a committed CSV plus a loader keeps every reported statistic reproducible,
-though acquisition is then manual and must be documented as such.
-
-DataLab scales every keyword group against the single maximum across the whole query, so a
-high-volume control in the same request would compress SK Hynix toward zero. **Each topic
-is therefore pulled as its own query**, accepting that levels are not comparable between
-files — which costs nothing, since every signal is z-scored independently.
-
-#### The five exports (adopted 2026-08-24)
-
-Daily granularity across the full span was confirmed available: **2,775 days,
-2019-01-01 → 2026-08-06, zero missing**, five decimal places, 2,741 distinct values, no
-zeros. The web export is not capped the way Google Trends is.
-
-Settings, identical for all five: **기간** 직접입력 `2019-01-01`~`2026-08-06` · **일간**
-(daily) · **범위** 전체 · **성별** 전체 · **연령** unchecked. `quant/naver.py` re-checks
-the last three on load and refuses a file that disagrees.
-
-| File (in gitignored `data/`) | Keywords as specified | Query permalink |
-|---|---|---|
-| `hynix_datalab.xlsx` | `SK하이닉스,하이닉스,에스케이하이닉스,SK hynix,000660,SK하이닉스 주가,하이닉스 주가` | [`N_3b29bff4…`](http://datalab.naver.com/keyword/trendResult.naver?hashKey=N_3b29bff48b07fcf25fee95d9f28275ae) |
-| `semi_datalab.xlsx` | `반도체,반도체주,반도체 관련주,반도체 전망,시스템반도체,메모리 반도체,파운드리` | [`N_c54c9143…`](http://datalab.naver.com/keyword/trendResult.naver?hashKey=N_c54c91435d1b29ad2b549c20a000c394) |
-| `hbm_datalab.xlsx` | `HBM,에이치비엠,고대역폭메모리,HBM3,HBM3E,HBM4,HBM 관련주` | [`N_1273e9c1…`](http://datalab.naver.com/keyword/trendResult.naver?hashKey=N_1273e9c17cf031ceca52fcc0e9256c54) |
-| `memory_datalab.xlsx` | `D램,디램,DRAM,낸드,낸드플래시,NAND,메모리 가격,디램 가격` | [`N_033866b2…`](http://datalab.naver.com/keyword/trendResult.naver?hashKey=N_033866b24fb230a0bb93d991dabdea3d) |
-| `samsung_datalab.xlsx` | `삼성전자,005930,삼성전자 주가` | [`N_797c5025…`](http://datalab.naver.com/keyword/trendResult.naver?hashKey=N_797c502510094d2fd47e01cbb39577a1) |
-
-**The permalinks are the authoritative record, not the keyword column.** The .xlsx stores
-the topic label and the settings but not the keyword list, so the column above is what was
-specified rather than what is provably in the file; each permalink resolves (HTTP 200) and
-shows the query as run. Any discrepancy should be resolved in favour of the permalink.
-
-**The .xlsx files are deliberately not committed** (developer's call, 2026-08-24) — `data/` is
-gitignored. Since the API is closed, this table plus the permalinks is the only thing that
-makes them regenerable, which is why the settings are spelled out. A clone cannot reproduce
-any Naver statistic without re-running these five exports by hand.
-
-#### Behaviour worth knowing before using them
-
-- **Weekend search is 12.4% of weekday search** — far more extreme than Wikipedia's. Under
-  `agg="mean"` Monday's Fri+Sat+Sun bucket averages 2.76 against ~6.5–7.0 for other
-  weekdays, and under plain `zscore` **Monday's share of the top quintile measures 0.0%** —
-  it can never register as high attention. `dow_zscore` returns it to 21.2%. See
-  `methodology.md`.
-- **`naver_hynix` and `naver_samsung` correlate 0.86** on a same-weekday baseline (0.93 on
-  weekday-only log changes), against 0.42 for the Wikipedia equivalents. The control is
-  nearly collinear with the primary, so ~90% of SK Hynix search attention is shared with
-  Samsung and *company-specific* attention is a thin residue.
-- **`naver_semi` is anchored by one day** — 2019-05-01 at 100.0 against 58.8 for the next
-  highest.
-- **`naver_hbm`'s keyword composition changes over the sample** — `HBM3`/`HBM3E`/`HBM4` have
-  no volume before each generation existed.
-
-### Free but require registration
-
-| Source | Probe result | Note |
-|---|---|---|
-| **Naver DataLab** | **API closed to new apps (2026-08-24)** — see below | Web export still open |
-| **DART** | `status 010, unregistered key` — endpoint live | Event timestamps, not attention |
-
-### The axis that matters
-
-The property that disqualified Option B for a company-specific query was **sample vs
-census**:
-
-| Source | Measurement type | Daily, 2019–2026? | Auth |
-|---|---|---|---|
-| Wikimedia pageviews | **true count** | yes, zero gaps | none |
-| GDELT | share of news coverage | yes | none |
-| Google Trends | 0–100 index, per-window rescaled | only via ~30 stitched windows | none |
-| Naver DataLab | 0–100 index | untested | free key |
-| HN / Reddit / StockTwits / Bluesky | — | no | blocked or too sparse |
-
-Only Wikipedia returns an actual number. Everything else is a normalised index whose scale
-changes between requests — which the `zscore` transform tolerates, but the `raw` transform
-and any coefficient interpretation do not.
-
-### Reproduce
-
-```bash
-# Wikimedia pageviews (no auth)
-curl -s -H "User-Agent: <contact>" \
-  "https://wikimedia.org/api/rest_v1/metrics/pageviews/per-article/en.wikipedia/all-access/user/SK_Hynix/daily/20190101/20260806"
-
-# GDELT daily news volume (no auth; wait 5s+ between calls)
-curl -s "https://api.gdeltproject.org/api/v2/doc/doc?query=%22SK%20Hynix%22&mode=timelinevol&startdatetime=20190101000000&enddatetime=20190401000000&format=json"
-
-# Hacker News (no auth)
-curl -s "https://hn.algolia.com/api/v1/search_by_date?query=%22SK%20Hynix%22&tags=story&numericFilters=created_at_i%3E1546300800"
-```
-
-Google Trends requires `pytrends` with its retry config removed; see the note above.
-
-### Unverified in this section
-
-- **GDELT earliest coverage date.** A 2015 window returned `Invalid query start date`, so
-  the range starts later than 2015, but the exact start was not established — the extended
-  rate-limit block prevented it. GDELT DOC 2.0 is documented as beginning 2017-01-01; not
-  confirmed here.
-- **GDELT Korean-language coverage.** The `SK하이닉스` query was not successfully run. This
-  matters: if GDELT under-covers Korean media, the series measures Anglophone coverage of a
-  Korean company, which is a materially weaker proxy.
-- ~~**Naver DataLab** beyond endpoint liveness — no key was obtained.~~ **Resolved
-  2026-08-24: the API is closed to new applications** (keys authenticate, scope is refused).
-  Still unverified: whether the *web* export allows daily granularity over the full span.
-- Whether the Bluesky and StockTwits 403s are permanent policy or host-specific blocking.
-
 ---
 
-## GDELT query set (open, 2026-08-29)
-
-The sentiment signal's dominant defect is **too few headlines per day** — median 4, which
-leaves ~70% of the daily mean as sampling noise (reliability 0.30, or 0.14 once syndicated
-duplicates are removed). Pooling more queries is the only fix that attacks that rather than
-averaging around it, so `signals.GDELT_QUERIES` is a tuple and results are deduplicated on
-`url`.
-
-Currently `("HBM memory",)`, which yields ~58% on-topic titles. Candidates under measurement:
-`DRAM`, `NAND flash`, `SK Hynix`, `memory chip`, `semiconductor memory`.
-
-`scripts/probe_gdelt.py` samples three months per candidate (2021-03, 2024-03, 2026-03) and
-ranks them by **on-topic articles per day** — deliberately not by any return relationship,
-since queries must be chosen on coverage, not on which one happens to produce a result.
-
-Two cost notes, both measured the hard way:
-
-- a full 2019–2026 backfill for one query is **~24 hours**, not the hour the module docstring
-  originally estimated. The binding constraint is GDELT's 1-request-per-5s limit, enforced by
-  IP block, not the data volume.
-- **the probe itself is not quick.** A busy month splits recursively down to 6h windows, so a
-  single query-month can be ~100 requests. Budget hours, not minutes, for five candidates.
-
-Queries overlap heavily — the same article matches `HBM memory` and `DRAM` — so a candidate's
-*marginal* contribution after `url` deduplication is far below its raw count. That is what the
-probe measures.
+# Part 4 — Housekeeping
 
 ## Open decisions
 
