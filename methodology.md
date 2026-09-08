@@ -426,6 +426,78 @@ result was an artifact of the ad-hoc 60-day centring used while diagnosing, and 
 here as a **false positive that the corrected pipeline killed** — which is precisely why the
 definition changes had to land before the rule was chosen.
 
+### Fitting the linear weight walk-forward, and what it cost
+
+`linear`'s weight was always a hand-set slider. On 2026-09-01 the developer asked for it to be
+estimated instead. The rule is `linear_wf`; the estimator is `panel.walk_forward_weight`.
+
+**Why walk-forward and not a frozen fit.** A weight chosen with knowledge of the returns it is
+then tested on is not a weight, it is a result. Walk-forward removes that: each day's weight is
+fitted only on rows whose forward return had already been realised — `d + horizon <= t` — so
+no output day is fitted on itself. That inequality is the entire difference between this and
+look-ahead, and is pinned by tests at h=1 and h=3.
+
+**The originally proposed design was killed by coverage, measured before building.** Usable
+rows for the fit (`dow_zscore` attention × `zscore` sentiment × `fwd_ret_1`, all non-NaN):
+
+| year | trading days | usable rows |
+|---|---|---|
+| 2019 | 246 | 4 |
+| 2020 | 248 | 13 |
+| 2021 | 248 | 31 |
+| 2022 | 246 | 26 |
+| 2023 | 245 | 94 |
+| 2024 | 244 | 226 |
+| 2025 | 242 | 207 |
+| 2026 (to 08-06) | 146 | 144 |
+| **total** | 1,865 | **744** |
+
+The whole pre-2023 window contains **74 rows**, so a frozen fit on it could not honour a
+200-observation cap, and asking for the most recent 200 before 2023 reaches back to
+**2019-02-01** — precisely the early-year behaviour the cap existed to exclude. GDELT is the
+binding constraint, not Naver, which covers 1,864 of 1,865 days: GDELT has raw values on 1,054
+and `zscore` costs a further **309**, because it needs 10 non-NaN values in the trailing 20
+*trading* days and pre-2024 GDELT is too sparse to clear that bar. 2019 falls from 80 raw days
+to 4.
+
+Resolved by keeping the refit running past 2023, which costs nothing in honesty and makes the
+cap real. `WF_WINDOW = 200` first binds on **2024-03-15**; `WF_MIN_OBS = 60` puts the first
+weight on **2022-11-25**, before the 2023-01-01 sample results are reported on.
+
+**Why `w = β_s / β_a` rather than the fitted value `β_a·a + β_s·s`.** The ratio keeps `weight`
+meaning exactly what the slider means, so a fitted w is directly comparable to the sweep table
+above and `w = 0` still reads as attention alone. The fitted value would have needed no guards
+but would have let attention's own scale drift with the fit, making a fixed tail cut of 2.5
+mean different things in different years. Developer's call.
+
+The ratio is unbounded, so two guards: `β_a <= 0 → w = 0` (a non-positive attention
+coefficient means the fit has lost the arm the weight is expressed *relative to*, and the
+ratio's sign stops meaning anything), and otherwise clip to `±WF_CLIP`. **The clip and
+fall-back rates are the diagnostic that says whether the ratio form is usable at all**, and
+both the dashboard and `run_test.py` report them unconditionally.
+
+**Result — the fitted weight makes the signal worse.** `fwd_ret`, h=1, full history loaded so
+the fit has its training rows:
+
+| specification | rank IC | HAC p | n |
+|---|---|---|---|
+| `linear`, w = 0 (attention alone) | +0.0356 | 0.0544 | 735 |
+| `linear_wf`, w fitted | +0.0069 | 0.9104 | 675 |
+
+The fitted weight ran mean **−0.093**, hit the ±2 bound on **4.3%** of days and fell back to
+zero on **47.5%** — the attention coefficient was not even positive on nearly half of them.
+This is consistent with everything else here: the manual sweep's optimum was `w = 0` in both
+directions, and `findings.md` §5 already concluded sentiment adds nothing. **Estimating the
+weight from data did not rescue sentiment; it confirmed there is nothing to weight.** No
+constant was tuned to make this come out differently.
+
+Two caveats that keep this from being more than it is. Walk-forward removes look-ahead, not
+the fact that 2023+ generated every hypothesis in `findings.md` — `linear_wf` is one more
+specification on the same explored sample, not an out-of-sample confirmation. And `--start`
+must reach back before the test window or the training rows do not exist at all: `run_test.py`
+slices prices before building the signal, so `--start 2023-01-01` pushed the first fit to
+2023-11-21 and threw away every pre-2023 row.
+
 ### A documented false positive: the "gated" rule
 
 While sweeping combination rules, *sentiment restricted to high-attention days* came back at

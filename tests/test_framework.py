@@ -1613,6 +1613,164 @@ def test_dashboard_offers_both_combine_rules_and_agrees_with_the_library():
     assert not at.exception
 
 
+# --- walk-forward weight ----------------------------------------------------
+
+
+def _wf_inputs(seed=7, n=400, horizon=1):
+    """Attention, sentiment and a forward return on one business-day calendar."""
+    px = fake_px(n=n)
+    rng = np.random.default_rng(seed)
+    idx = px.index
+    att = pd.Series(rng.standard_normal(n), index=idx)
+    sen = pd.Series(rng.standard_normal(n), index=idx)
+    fwd = panel.add_targets(px, horizon=horizon)[f"fwd_ret_{horizon}"]
+    return att, sen, fwd
+
+
+@pytest.mark.parametrize("horizon", [1, 3])
+def test_walk_forward_weight_cannot_see_the_day_it_is_used_on(horizon):
+    """The whole feature is worthless if the fit peeks, so this is the test.
+
+    A fwd_ret_h dated d is first known at the close of d+h, so day t may fit on
+    rows with d + h <= t and no others. Corrupting every forward return from a
+    cut date onward must leave every weight at or before that date untouched —
+    an off-by-one in that inequality shows up here and essentially nowhere else.
+    """
+    att, sen, fwd = _wf_inputs(horizon=horizon)
+    base = panel.walk_forward_weight(att, sen, fwd, horizon=horizon, min_obs=40)
+
+    for cut in (200, 260, 320):
+        poisoned = fwd.copy()
+        poisoned.iloc[cut:] = 99.0
+        got = panel.walk_forward_weight(att, sen, poisoned, horizon=horizon,
+                                        min_obs=40)
+        # A weight dated t may use returns dated up to t-h, whose last input day
+        # is t. So everything up to and including position `cut` is unaffected.
+        pd.testing.assert_series_equal(base.iloc[:cut + 1], got.iloc[:cut + 1])
+        assert not base.iloc[cut + 1:].equals(got.iloc[cut + 1:]), \
+            "poisoning the future changed nothing — the fit is not running"
+
+
+def test_walk_forward_weight_never_fits_on_more_than_its_window():
+    """The window is capped, not expanding — the developer's call.
+
+    Behaviour in the early years differs enough that a 2019 observation should
+    not still be steering a 2026 weight. Asserted by making the tail of the
+    sample contradict its head: once the window has rolled past the head, the
+    weight must match a fit that never saw the head at all.
+    """
+    att, sen, fwd = _wf_inputs(n=600)
+    window, min_obs = 100, 40
+    full = panel.walk_forward_weight(att, sen, fwd, window=window,
+                                     min_obs=min_obs)
+
+    # Corrupt the EARLY forward returns rather than dropping the days: dropping
+    # them would also move _unit_scale's expanding baseline, so the arms would
+    # differ and the test would prove nothing about the window.
+    poisoned = fwd.copy()
+    poisoned.iloc[:200] = -99.0
+    got = panel.walk_forward_weight(att, sen, poisoned, window=window,
+                                    min_obs=min_obs)
+
+    tail = full.index[-50:]
+    pd.testing.assert_series_equal(full.loc[tail], got.loc[tail])
+    early = full.index[200:260]
+    assert not full.loc[early].equals(got.loc[early]), \
+        "the early rows were never in any window — the fit is not running"
+
+
+def test_walk_forward_weight_waits_for_min_obs():
+    """No weight until the fit has enough to estimate from.
+
+    Only 74 usable rows exist before 2023 on the real pair, so this constant is
+    what decides where the series starts, not a date.
+    """
+    att, sen, fwd = _wf_inputs()
+    w = panel.walk_forward_weight(att, sen, fwd, min_obs=120)
+    first = w.notna().argmax()
+    assert w.iloc[:first].isna().all()
+    # _unit_scale needs MIN_BASELINE observations before it emits anything, so
+    # the usable rows start at position 9, not 0. The 120th of those sits at
+    # 128, and its h=1 return is realised the following day.
+    expected = panel.MIN_BASELINE - 1 + 120
+    assert first == expected, f"first weight at {first}, expected {expected}"
+
+
+def test_walk_forward_weight_guards_the_ratio():
+    """b_s / b_a is unbounded, so both guards have to hold.
+
+    A non-positive attention coefficient means the fit has lost the arm the
+    weight is expressed relative to, and the ratio's sign stops meaning
+    anything — hence falling back to attention alone rather than using it.
+    """
+    n = 300
+    idx = pd.bdate_range("2019-01-02", periods=n, name="date")
+    rng = np.random.default_rng(3)
+    att = pd.Series(rng.standard_normal(n), index=idx)
+    sen = pd.Series(rng.standard_normal(n), index=idx)
+
+    # b_a strongly negative: fall back to 0.
+    neg = panel.walk_forward_weight(att, sen, -3.0 * att, min_obs=40)
+    assert (neg.dropna() == 0.0).all()
+
+    # b_a ~ 0 with a large b_s: clipped, never infinite.
+    huge = panel.walk_forward_weight(att, sen, 50.0 * sen, min_obs=40)
+    assert np.isfinite(huge.dropna()).all()
+    assert (huge.dropna().abs() == panel.WF_CLIP).all(), \
+        "an unbounded ratio should have been clipped to the bound exactly"
+
+
+def test_walk_forward_weight_is_fitted_on_the_scale_combine_adds():
+    """w must be in the units combine works in, or it means the wrong thing.
+
+    combine divides each arm by its expanding sd before summing. dow_zscore
+    attention runs at sd ~3.2 against a zscore's ~1.1, so a ratio fitted on the
+    unscaled arms would be wrong by roughly a factor of three. Rescaling an
+    input must therefore leave the combined signal unchanged.
+    """
+    att, sen, fwd = _wf_inputs()
+    w1 = panel.walk_forward_weight(att, sen, fwd, min_obs=40)
+    w2 = panel.walk_forward_weight(att, 10.0 * sen, fwd, min_obs=40)
+    pd.testing.assert_series_equal(w1, w2)
+
+    c1 = panel.combine(att, sen, rule="linear_wf", weight=w1)
+    c2 = panel.combine(att, 10.0 * sen, rule="linear_wf", weight=w2)
+    pd.testing.assert_series_equal(c1, c2)
+
+
+def test_linear_wf_is_the_linear_sum_with_a_per_day_weight():
+    """The two linear rules must be one expression, or a fitted w drifts from a set one."""
+    att, sen, _ = _wf_inputs()
+    w = pd.Series(0.3, index=att.index)
+    pd.testing.assert_series_equal(
+        panel.combine(att, sen, rule="linear_wf", weight=w),
+        panel.combine(att, sen, rule="linear", weight=0.3))
+
+    # Where the fit fell back to zero, the day is attention alone.
+    w0 = w.copy()
+    w0.iloc[:100] = 0.0
+    got = panel.combine(att, sen, rule="linear_wf", weight=w0)
+    alone = panel._unit_scale(att).rename("combined")
+    pd.testing.assert_series_equal(got.iloc[:100].dropna(),
+                                   alone.iloc[:100].dropna())
+
+
+def test_linear_wf_has_no_weight_slider():
+    """The weight is fitted, so offering a slider would be offering a lie."""
+    from streamlit.testing.v1 import AppTest
+
+    at = AppTest.from_file(str(ROOT / "app.py"), default_timeout=900).run()
+    src = [r for r in at.radio if r.label == "Source"][0]
+    src.set_value("Combined")
+    at.run()
+    rule = [r for r in at.radio if r.label == "Rule"][0]
+    rule.set_value("linear_wf")
+    at.run()
+    assert not at.exception, at.exception
+    assert not [s for s in at.slider if s.label == "Weight on sentiment"], \
+        "linear_wf must not expose a weight to set"
+
+
 def test_combine_defaults_are_per_rule_and_shared_by_app_and_cli():
     """The two rules need different things from sentiment, so defaults differ.
 

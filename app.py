@@ -128,7 +128,7 @@ source = st.sidebar.radio(
          "series. How they are folded is the Rule control below.")
 
 combine_rule, combine_weight = "product", 0.0
-att_t = sen_t = None
+att_t = sen_t = wsum = None
 if source == "Single":
     sig_name = _pick("Signal", "naver_hynix", "sig_one")
     att_name = sen_name = None
@@ -144,7 +144,9 @@ else:
              "transforms, negative × negative reads positive — hence the `raw` "
              "sentiment default. "
              "linear: attention + w × sentiment, each scaled to unit variance, "
-             "w signed.")
+             "w signed. "
+             "linear_wf: the same sum with w fitted walk-forward by OLS on "
+             "history only, so there is no slider.")
     _d = panel_mod.COMBINE_DEFAULTS[combine_rule]
     # Keys are per rule so switching rules adopts that rule's defaults instead
     # of silently carrying the previous rule's selection across.
@@ -228,6 +230,14 @@ try:
                                   kind=att_t, window=int(window))
         sen = panel_mod.transform(signals.load_signal(sen_name, px, kospi),
                                   kind=sen_t, window=int(window))
+        if combine_rule == "linear_wf":
+            # The fit needs the target, so it happens here rather than inside
+            # combine, which never sees a forward return.
+            fwd = panel_mod.add_targets(px, kospi=kospi,
+                                        horizon=horizon)[f"fwd_ret_{horizon}"]
+            combine_weight = panel_mod.walk_forward_weight(att, sen, fwd,
+                                                           horizon=horizon)
+            wsum = panel_mod.weight_summary(combine_weight)
         sig = panel_mod.combine(att, sen, window=int(window),
                                 rule=combine_rule, weight=combine_weight)
 except FileNotFoundError as exc:
@@ -254,7 +264,8 @@ tab_describe, tab_test, tab_price = st.tabs(["Signal", "Test", "Price"])
 with tab_describe:
     st.title(f"`{sig_name}`")
     st.caption(f"transform `{tkind}` · {start} → {end}"
-               + (f" · attention × sentiment, rank-weighted" if source == "Combined" else ""))
+               + (f" · attention + sentiment, rule `{combine_rule}`"
+                  if source == "Combined" else ""))
 
     cov = panel_mod.coverage(pnl["signal_raw"])
     gaps, have = cov["gaps"], cov["n_have"]
@@ -297,6 +308,53 @@ with tab_describe:
                 "as NaN rather than filled, so they drop out of every statistic "
                 "instead of being counted as zero."
             )
+
+    # --- the fitted weight, when there is one -------------------------------
+    # Belongs here rather than in Test: it describes how the signal was BUILT.
+    # It is the one thing on this tab estimated from forward returns, which is
+    # why the caption says so - but only from returns already realised, so it
+    # still cannot see the days it is used on.
+    if wsum is not None:
+        st.subheader("Fitted weight on sentiment")
+        if wsum["n"] == 0:
+            st.warning(
+                f"No weight could be fitted — fewer than {panel_mod.WF_MIN_OBS} "
+                "days have both signals and a realised forward return in this "
+                "window. Widen **Start** to give the fit some history.",
+                icon="📐")
+        else:
+            a_, b_, c_, d_ = st.columns(4)
+            a_.metric("Mean w", f"{wsum['mean']:+.3f}",
+                      help="Signed. 0 is attention alone.")
+            b_.metric("Range", f"{wsum['min']:+.2f} … {wsum['max']:+.2f}")
+            c_.metric("Clipped", f"{wsum['clipped']:.0%}",
+                      help=f"Days where |w| hit the ±{panel_mod.WF_CLIP:g} bound. "
+                           "A high figure means the ratio is unstable and the "
+                           "fitted weight should not be trusted.")
+            d_.metric("Fell back to 0", f"{wsum['zeroed']:.0%}",
+                      help="Days where the fitted attention coefficient was not "
+                           "positive, so the weight reverts to attention alone.")
+            wser = combine_weight.dropna().rename("w").reset_index()
+            wser.columns = ["date", "w"]
+            st.altair_chart(
+                styled(alt.Chart(wser).mark_line(color=SERIES, strokeWidth=1).encode(
+                    x=alt.X("date:T", title=None),
+                    y=alt.Y("w:Q", title="w on sentiment"),
+                    tooltip=[alt.Tooltip("date:T", title="Date"),
+                             alt.Tooltip("w:Q", title="w", format="+.3f")],
+                ).properties(title=f"Fitted weight — rolling "
+                                   f"{panel_mod.WF_WINDOW}-observation OLS, first "
+                                   f"fit {wsum['first']:%Y-%m-%d}"), height=160),
+                width="stretch")
+            st.caption(
+                f"`w = β_sentiment / β_attention`, refitted every day on the most "
+                f"recent {panel_mod.WF_WINDOW} days whose {horizon}-day forward "
+                "return had already been realised. Estimated from returns, but "
+                "never from the day it is applied to. Days before the first fit "
+                "have no combined signal at all and drop out of every statistic — "
+                "so **Start** has to reach back far enough to pay for the burn-in, "
+                "or the sample loses its first year to it.")
+        st.divider()
 
     # --- the series itself --------------------------------------------------
 
@@ -415,7 +473,7 @@ with tab_test:
     hi = float(tl["signal"].quantile(0.999))
     default = stats.TAIL_Z if lo < stats.TAIL_Z < hi else float(
         tl["signal"].quantile(0.90))
-    step = max(round((hi - lo) / 40, 4), 1e-4)
+    step = max(round((hi - lo) / 200, 4), 1e-4)
     # The unit depends on the transform: a z-score under zscore/dow_zscore, but
     # the signal's own units under raw — Naver's 0-100 index, Wikipedia's view
     # counts. Naming it after the actual transform avoids implying a z-score
@@ -432,10 +490,16 @@ with tab_test:
                                 "z-score, not for `raw`.")
     tail_side = SIDE_LABEL[side_label]
     with tc_:
-        tail_z = st.slider(f"Outlier threshold ({unit})", lo, hi, default, step,
-                           help=f"Measured in {unit} because the transform is "
-                                f"`{tkind}`, so the cut is comparable only "
-                                "within one transform.")
+        # A number box rather than a slider: the sensitivity grid below invites
+        # checking one specific cut, and a slider cannot be landed on a value
+        # exactly. Bounds still come from the data, for the reason above.
+        tail_z = st.number_input(f"Outlier threshold ({unit})", lo, hi, default,
+                                 step, format="%.4f",
+                                 help=f"Measured in {unit} because the transform "
+                                      f"is `{tkind}`, so the cut is comparable "
+                                      f"only within one transform. Range "
+                                      f"{lo:.4g} to {hi:.4g}, the signal's own "
+                                      "50th to 99.9th percentile.")
 
     # `raw` is not centred on zero - Naver's index runs 0-100 - so a symmetric
     # cut selects nothing or everything. Say so rather than showing an empty test.

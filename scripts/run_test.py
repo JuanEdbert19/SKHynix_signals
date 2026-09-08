@@ -31,9 +31,10 @@ def main():
                          "--signal; see --combine-rule for how they are folded.")
     ap.add_argument("--combine-rule", default="product", dest="combine_rule",
                     choices=panel_mod.COMBINE_RULES,
-                    help="product: attention as a trailing percentile rank in "
-                         "[0,1] times sentiment, which supplies the sign. "
-                         "linear: z(attention) + w*z(sentiment), w signed.")
+                    help="product: the two transformed signals multiplied. "
+                         "linear: z(attention) + w*z(sentiment), w signed and "
+                         "set by --combine-weight. linear_wf: the same sum with "
+                         "w fitted walk-forward by OLS on history only.")
     ap.add_argument("--att-transform", default=None, dest="att_transform",
                     choices=panel_mod.TRANSFORMS,
                     help="transform for the attention leg of --combine; "
@@ -67,6 +68,7 @@ def main():
     px = prices.load_prices(start=args.start, end=args.end)
     kospi = prices.load_index(start=args.start, end=args.end)
 
+    wsum = None
     if args.combine:
         # The Combine tab picks its pair in the UI, so nothing is registered in
         # SIGNALS. This flag is what keeps a combined result reproducible from
@@ -83,11 +85,23 @@ def main():
         d = panel_mod.COMBINE_DEFAULTS[args.combine_rule]
         att_t = args.att_transform or d["attention"]
         sen_t = args.sen_transform or d["sentiment"]
-        weight = d["weight"] if args.combine_weight is None else args.combine_weight
         att = panel_mod.transform(signals.load_signal(att_name, px, kospi),
                                   kind=att_t, window=args.window)
         sen = panel_mod.transform(signals.load_signal(sen_name, px, kospi),
                                   kind=sen_t, window=args.window)
+        if args.combine_rule == "linear_wf":
+            if args.combine_weight is not None:
+                ap.error("--combine-weight cannot be used with --combine-rule "
+                         "linear_wf; the weight is fitted, not set")
+            # The fit needs the target, so it happens here rather than inside
+            # combine, which never sees a forward return.
+            fwd = panel_mod.add_targets(px, kospi=kospi,
+                                        horizon=args.horizon)[f"fwd_ret_{args.horizon}"]
+            weight = panel_mod.walk_forward_weight(att, sen, fwd,
+                                                   horizon=args.horizon)
+            wsum = panel_mod.weight_summary(weight)
+        else:
+            weight = d["weight"] if args.combine_weight is None else args.combine_weight
         sig = panel_mod.combine(att, sen, window=args.window,
                                 rule=args.combine_rule, weight=weight)
         args.signal = (f"combine({att_name}[{att_t}]x{sen_name}[{sen_t}],"
@@ -115,6 +129,19 @@ def main():
           f"horizon={args.horizon}")
     print(f"sample={pnl.index[0].date()}..{pnl.index[-1].date()}  "
           f"trading days={len(pnl)}")
+
+    if wsum is not None:
+        # clipped and zeroed are the honest part: they say how often the ratio
+        # had to be rescued rather than estimated.
+        print(f"\nfitted weight — rolling {panel_mod.WF_WINDOW}-observation OLS, "
+              f"history only")
+        print(f"  first fit     {wsum['first'].date()}  ({wsum['n']:,} days weighted)")
+        print(f"  w             mean {wsum['mean']:+.3f}  "
+              f"range {wsum['min']:+.3f}..{wsum['max']:+.3f}")
+        print(f"  clipped       {wsum['clipped']:.1%} of days at "
+              f"±{panel_mod.WF_CLIP:g}")
+        print(f"  fell back     {wsum['zeroed']:.1%} of days to w=0 "
+              "(attention coefficient not positive)")
 
     print(f"\n  rank IC       {res['ic']:+.4f}")
     print(f"  HAC t         {res['t_hac']:+.2f}")
@@ -172,6 +199,11 @@ def main():
         "quantiles": qt.to_dict(orient="records"),
         "tail_curve": curve.to_dict(orient="records"),
         "reverse_causality": rev,
+        "fitted_weight": (None if wsum is None
+                          else {**wsum, "first": str(wsum["first"].date()),
+                                "window": panel_mod.WF_WINDOW,
+                                "min_obs": panel_mod.WF_MIN_OBS,
+                                "clip": panel_mod.WF_CLIP}),
         "run_utc": stamp,
     }, indent=2, default=float))
     print(f"\nwrote {out.relative_to(ROOT)}")

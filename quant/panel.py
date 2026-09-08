@@ -109,7 +109,12 @@ def build_panel(px, sig, transform_kind="zscore", window=20, kospi=None,
     return panel
 
 
-COMBINE_RULES = ("product", "linear")
+COMBINE_RULES = ("product", "linear", "linear_wf")
+
+# Walk-forward fit of the linear rule's weight. See walk_forward_weight.
+WF_WINDOW = 200    # most observations one fit may use
+WF_MIN_OBS = 60    # fewest before any weight is emitted
+WF_CLIP = 2.0      # matches the manual slider's range
 
 # Per-rule defaults for the two legs and the weight. They differ by rule because
 # the rules need different things from sentiment, which is the whole reason the
@@ -127,9 +132,13 @@ COMBINE_RULES = ("product", "linear")
 #
 # Set by the developer on 2026-08-30. Both are starting points in the UI, not
 # fixed specifications - run_test.py takes explicit flags for a recorded result.
+#   linear_wf  same arms as linear, but `weight` is fitted rather than set, so
+#            the entry carries None. A caller seeing None must call
+#            walk_forward_weight; there is no sensible fallback number.
 COMBINE_DEFAULTS = {
     "product": {"attention": "dow_zscore", "sentiment": "raw", "weight": 0.0},
     "linear": {"attention": "dow_zscore", "sentiment": "zscore", "weight": 1.0},
+    "linear_wf": {"attention": "dow_zscore", "sentiment": "zscore", "weight": None},
 }
 
 
@@ -155,7 +164,12 @@ def combine(attention, sentiment, window=20, rule="product", weight=0.0):
       should stay meaningful. And one day can dominate: dow_zscore reaches
       +38.9, giving a single observation ~82x the median magnitude.
 
-    `linear` - z(attention) + weight * z(sentiment), `weight` SIGNED.
+    `linear` / `linear_wf` - z(attention) + weight * z(sentiment), SIGNED.
+      One expression serves both rules, which is deliberate: it is what makes a
+      weight fitted by walk_forward_weight mean exactly what a weight set on the
+      slider means. They differ only in where `weight` comes from, and
+      `linear_wf` passes a Series rather than a float - one weight per day,
+      aligned on the index, NaN through the burn-in.
       The sign matters because the two signals were measured pointing opposite
       ways: on their own top-25 days attention ran +0.94% and sentiment -0.97%,
       at a mutual correlation of -0.03. A non-negative weight makes them cancel,
@@ -185,6 +199,94 @@ def combine(attention, sentiment, window=20, rule="product", weight=0.0):
     both = pd.concat([_unit_scale(attention).rename("a"),
                       _unit_scale(sentiment).rename("s")], axis=1)
     return (both["a"] + weight * both["s"]).rename("combined")
+
+
+def walk_forward_weight(attention, sentiment, fwd, horizon=1, window=WF_WINDOW,
+                        min_obs=WF_MIN_OBS, clip=WF_CLIP):
+    """Fit the linear rule's sentiment weight from history only, one w per day.
+
+    Regresses the forward return on both arms and returns the ratio of their
+    coefficients, so the result plugs straight into `combine(rule="linear_wf")`
+    and reads on the same scale as the manual slider:
+
+        fwd ~ c + b_a * a + b_s * s        ->        w = b_s / b_a
+
+    Fitted on the UNIT-SCALED arms, because those are what `combine` adds. A
+    ratio fitted on the untransformed arms would be in the wrong units, and
+    dow_zscore attention runs at sd ~3.2 against a zscore's ~1.1, so the error
+    would be a factor of three rather than a rounding difference.
+
+    Only rows whose forward return had already been REALISED are eligible: a
+    fwd_ret_h dated d is first known at the close of d+h, so day t may fit on
+    rows with d + h <= t and no others. That inequality is the whole difference
+    between a walk-forward weight and a look-ahead one, and is pinned by tests
+    at h=1 and h=3.
+
+    The window is capped at `window` observations rather than expanding, at the
+    developer's request: behaviour in the early years differs enough that a
+    2019 observation should not still be steering a 2026 weight. With the
+    default 200 the cap first binds on 2024-03-15. `min_obs` is what decides
+    when the series starts - only 74 usable rows exist before 2023, so 60 is
+    what gets a weight in place (2022-11-25) before the 2023-01-01 sample the
+    results are reported on, without demanding data that is not there.
+
+    Two guards, because a ratio of two noisy coefficients is not bounded:
+      b_a <= 0   -> w = 0, i.e. fall back to attention alone. A non-positive
+                   attention coefficient means the fit has lost the arm the
+                   weight is expressed relative to, and the ratio's sign stops
+                   meaning anything.
+      otherwise  -> clip to +/-clip. How often this binds is the diagnostic
+                   that says whether the ratio form is usable at all; both
+                   callers report it.
+    """
+    df = pd.concat([_unit_scale(attention).rename("a"),
+                    _unit_scale(sentiment).rename("s"),
+                    fwd.rename("y")], axis=1).dropna()
+
+    cal = attention.index
+    if df.empty:
+        return pd.Series(np.nan, index=cal, name="w")
+
+    # Position on the trading calendar, not the calendar date: `horizon` counts
+    # trading days, so the eligibility test has to as well.
+    pos = pd.Series(np.arange(len(cal)), index=cal).reindex(df.index).to_numpy()
+    design = np.column_stack([np.ones(len(df)), df["a"], df["s"]])
+    y = df["y"].to_numpy()
+
+    out = np.full(len(cal), np.nan)
+    k = 0  # rows of df realised as of the current day
+    for i in range(len(cal)):
+        while k < len(pos) and pos[k] + horizon <= i:
+            k += 1
+        if k < min_obs:
+            continue
+        lo = max(0, k - window)
+        beta = np.linalg.lstsq(design[lo:k], y[lo:k], rcond=None)[0]
+        b_a, b_s = beta[1], beta[2]
+        out[i] = 0.0 if b_a <= 0 else float(np.clip(b_s / b_a, -clip, clip))
+
+    return pd.Series(out, index=cal, name="w")
+
+
+def weight_summary(w, clip=WF_CLIP):
+    """Descriptive summary of a fitted weight series, for the app and the CLI.
+
+    `clipped` and `zeroed` are the ones that matter: they say how often the
+    ratio needed rescuing rather than estimating.
+    """
+    x = w.dropna()
+    if x.empty:
+        return {"n": 0, "first": None, "mean": np.nan, "min": np.nan,
+                "max": np.nan, "clipped": np.nan, "zeroed": np.nan}
+    return {
+        "n": int(len(x)),
+        "first": x.index[0],
+        "mean": float(x.mean()),
+        "min": float(x.min()),
+        "max": float(x.max()),
+        "clipped": float((x.abs() >= clip - 1e-12).mean()),
+        "zeroed": float((x == 0.0).mean()),
+    }
 
 
 def _unit_scale(sig):

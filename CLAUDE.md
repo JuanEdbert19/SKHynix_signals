@@ -62,7 +62,7 @@ all reduce to one number per trading day, which is the only interface it require
 | `quant/gdelt.py` | News headlines from GDELT DOC 2.0 — adaptive windowing, resumable per month |
 | `quant/sentiment.py` | FinBERT headline scoring, `P(pos) − P(neg)`, cached by headline hash |
 | `quant/align.py` | UTC **and KST** signal timestamps → KRX trading date. **The only module with timezone logic** |
-| `quant/panel.py` | Forward-return targets, signal transforms, `combine`, coverage and distribution summaries |
+| `quant/panel.py` | Forward-return targets, signal transforms, `combine`, `walk_forward_weight`, coverage and distribution summaries |
 | `quant/signals.py` | Signal registry + the three validation fixtures |
 | `quant/stats.py` | Rank IC, quantile buckets, Newey-West regressions, reverse causality |
 | `scripts/probe_gdelt.py` | Measures articles/day and on-topic share for a candidate GDELT query, before committing to a backfill |
@@ -72,8 +72,11 @@ all reduce to one number per trading day, which is the only interface it require
 **Dashboard.** Three tabs, each answering one question. *Signal* describes what the thing
 is — coverage and gaps, the series over time, its distribution (sd, skew, kurtosis, extremes)
 and its correlation with any other signal. No forward returns appear there, deliberately: a
-signal should be judged trustworthy before it is judged useful. *Price* is the log-axis
-close chart with overlays.
+signal should be judged trustworthy before it is judged useful. The one exception is the
+**Fitted weight** panel, shown only under `linear_wf` — mean w, its range, the clip rate, the
+fall-back-to-zero rate and w over time. It is estimated from returns, but it describes how the
+signal was *built*, and hiding the fitted number inside the signal would be worse. *Price* is
+the log-axis close chart with overlays.
 
 *Test* runs two named tests, in this order, then reverse causality and the sample footer:
 
@@ -99,6 +102,16 @@ registered signal or a *combined* one, and a **Rule** control picks how the pair
 - `linear` — `attention + w · sentiment`, each arm put on a common scale by
   `panel._unit_scale` (an expanding, history-only sd), with **w signed** and exposed as a
   slider. `w = 0` is attention alone.
+- `linear_wf` — the same sum, but **w is fitted, not set**: `panel.walk_forward_weight`
+  regresses the forward return on both unit-scaled arms and returns `β_sentiment / β_attention`,
+  one value per day. Added 2026-09-01 (developer's call).
+
+`linear` and `linear_wf` are **one expression inside `combine`** — they differ only in where
+`weight` comes from, which is what makes a fitted w mean the same thing as a set one. `weight`
+may therefore be a float or a Series.
+
+**`combine` never sees a forward return.** Callers fit the weight first and pass the Series
+in, so the one function that builds the signal stays free of the target.
 
 **Neither rule transforms its inputs.** Each leg is transformed by the caller, and the
 transform is picked **per signal** — `Attention transform` / `Sentiment transform` in the
@@ -112,9 +125,20 @@ Defaults come from **`panel.COMBINE_DEFAULTS`, keyed by rule**, not from the sig
 |---|---|---|---|
 | `product` | `dow_zscore` | `raw` | — |
 | `linear` | `dow_zscore` | `zscore` | 1.0 |
+| `linear_wf` | `dow_zscore` | `zscore` | `None` — fitted |
 
 `raw` sentiment for the product is load-bearing: with two centred transforms negative ×
 negative reads positive, and raw sentiment is the only pairing that kept a testable tail.
+
+A `None` weight means *there is no sensible fallback number* — a caller seeing it must call
+`walk_forward_weight`. Its three constants live beside it: `WF_WINDOW = 200` (the fit is
+rolling, not expanding, so early-year behaviour leaves the estimator's view on its own),
+`WF_MIN_OBS = 60` (what decides where the weight series starts — only 74 usable rows exist
+before 2023, so a date could not), and `WF_CLIP = 2.0` (a ratio of two noisy coefficients is
+unbounded). **The fit only uses rows whose forward return was already realised** —
+`d + horizon <= t` — which is the single line that separates walk-forward from look-ahead and
+is pinned at h=1 and h=3. `--start` must reach back before the test window or the training
+rows do not exist: `run_test.py` slices prices before building the signal.
 
 Either branch produces one `sig`, so there is a single analysis path and nothing is rendered
 twice. This replaced a Combine tab that re-implemented a subset of the Test tab's output.
