@@ -6,6 +6,8 @@ exception — they are deliberately forward-looking, which is what makes them
 targets, and they are never used as inputs to a transform.
 """
 
+from typing import NamedTuple
+
 import numpy as np
 import pandas as pd
 
@@ -287,6 +289,68 @@ def weight_summary(w, clip=WF_CLIP):
         "clipped": float((x.abs() >= clip - 1e-12).mean()),
         "zeroed": float((x == 0.0).mean()),
     }
+
+
+class AssemblyResult(NamedTuple):
+    pnl: pd.DataFrame
+    tkind: str
+    att: object   # pd.Series | None — transformed attention leg (combined path)
+    sen: object   # pd.Series | None — transformed sentiment leg (combined path)
+    weight: object  # pd.Series | float | None — weight used (combined path)
+    wsum: object    # dict | None — weight diagnostics (linear_wf only)
+
+
+def assemble_signal(
+    px,
+    kospi,
+    *,
+    sig=None,
+    tkind="zscore",
+    att=None,
+    sen=None,
+    combine_rule="product",
+    att_t=None,
+    sen_t=None,
+    combine_weight=None,
+    window=20,
+    horizon=HORIZON,
+):
+    """Assemble a ready-to-analyse panel behind a single call.
+
+    Single-signal path: pass `sig` and `tkind`. Returns the panel from
+    build_panel.
+
+    Combined path: pass `att` and `sen` (raw Series keyed by trading date),
+    plus combine options. Transforms each leg, optionally fits the
+    walk-forward weight, combines, and calls build_panel.
+
+    Returns an AssemblyResult. att/sen/weight/wsum are None on the
+    single-signal path.
+    """
+    if sig is not None:
+        pnl = build_panel(px, sig, transform_kind=tkind, window=window,
+                          kospi=kospi, horizon=horizon)
+        return AssemblyResult(pnl, tkind, None, None, None, None)
+
+    d = COMBINE_DEFAULTS[combine_rule]
+    att_t = att_t or d["attention"]
+    sen_t = sen_t or d["sentiment"]
+    att_s = transform(att, kind=att_t, window=window)
+    sen_s = transform(sen, kind=sen_t, window=window)
+
+    wsum = None
+    if combine_rule == "linear_wf":
+        fwd = add_targets(px, kospi=kospi, horizon=horizon)[f"fwd_ret_{horizon}"]
+        weight = walk_forward_weight(att_s, sen_s, fwd, horizon=horizon)
+        wsum = weight_summary(weight)
+    else:
+        weight = d["weight"] if combine_weight is None else combine_weight
+
+    combined_sig = combine(att_s, sen_s, window=window,
+                           rule=combine_rule, weight=weight)
+    pnl = build_panel(px, combined_sig, transform_kind="raw",
+                      window=window, kospi=kospi, horizon=horizon)
+    return AssemblyResult(pnl, "raw", att_s, sen_s, weight, wsum)
 
 
 def _unit_scale(sig):

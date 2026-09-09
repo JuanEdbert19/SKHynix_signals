@@ -80,43 +80,41 @@ def main():
         for n in parts:
             if n not in signals.SIGNALS:
                 ap.error(f"unknown signal {n!r}; available: {sorted(signals.SIGNALS)}")
+        if args.combine_rule == "linear_wf" and args.combine_weight is not None:
+            ap.error("--combine-weight cannot be used with --combine-rule "
+                     "linear_wf; the weight is fitted, not set")
         # Defaults come from the rule, not the signal: the two rules need
         # different things from sentiment. One source of truth with the app.
         d = panel_mod.COMBINE_DEFAULTS[args.combine_rule]
         att_t = args.att_transform or d["attention"]
         sen_t = args.sen_transform or d["sentiment"]
-        att = panel_mod.transform(signals.load_signal(att_name, px, kospi),
-                                  kind=att_t, window=args.window)
-        sen = panel_mod.transform(signals.load_signal(sen_name, px, kospi),
-                                  kind=sen_t, window=args.window)
-        if args.combine_rule == "linear_wf":
-            if args.combine_weight is not None:
-                ap.error("--combine-weight cannot be used with --combine-rule "
-                         "linear_wf; the weight is fitted, not set")
-            # The fit needs the target, so it happens here rather than inside
-            # combine, which never sees a forward return.
-            fwd = panel_mod.add_targets(px, kospi=kospi,
-                                        horizon=args.horizon)[f"fwd_ret_{args.horizon}"]
-            weight = panel_mod.walk_forward_weight(att, sen, fwd,
-                                                   horizon=args.horizon)
-            wsum = panel_mod.weight_summary(weight)
-        else:
-            weight = d["weight"] if args.combine_weight is None else args.combine_weight
-        sig = panel_mod.combine(att, sen, window=args.window,
-                                rule=args.combine_rule, weight=weight)
+        weight = None if args.combine_rule == "linear_wf" else (
+            d["weight"] if args.combine_weight is None else args.combine_weight
+        )
+        res = panel_mod.assemble_signal(
+            px, kospi,
+            att=signals.load_signal(att_name, px, kospi),
+            sen=signals.load_signal(sen_name, px, kospi),
+            combine_rule=args.combine_rule,
+            att_t=att_t, sen_t=sen_t,
+            combine_weight=weight,
+            window=args.window, horizon=args.horizon,
+        )
+        wsum = res.wsum
         args.signal = (f"combine({att_name}[{att_t}]x{sen_name}[{sen_t}],"
                        f"{args.combine_rule}"
-                       + (f",w={weight:g}"
+                       + (f",w={res.weight:g}"
                           if args.combine_rule == "linear" else "") + ")")
-        # Both rules already return a bounded, stationary series: the product is
-        # a [0,1] rank times a z-score, and linear is a sum of z-scores.
-        tkind = "raw"
     else:
         tkind = args.transform or signals.DEFAULT_TRANSFORM.get(args.signal, "zscore")
-        sig = signals.load_signal(args.signal, px, kospi)
+        res = panel_mod.assemble_signal(
+            px, kospi,
+            sig=signals.load_signal(args.signal, px, kospi),
+            tkind=tkind, window=args.window, horizon=args.horizon,
+        )
 
-    pnl = panel_mod.build_panel(px, sig, transform_kind=tkind, window=args.window,
-                                kospi=kospi, horizon=args.horizon)
+    pnl = res.pnl
+    tkind = res.tkind
     res = stats.evaluate(pnl, horizon=args.horizon, target=args.target,
                          q=args.quantiles, tail_z=args.tail_z)
     curve = stats.tail_curve(pnl["signal"], pnl[f"{args.target}_{args.horizon}"],

@@ -221,25 +221,21 @@ px, kospi = get_prices(start, end)
 
 try:
     if source == "Single":
-        sig = signals.load_signal(sig_name, px, kospi)
+        res = panel_mod.assemble_signal(
+            px, kospi,
+            sig=signals.load_signal(sig_name, px, kospi),
+            tkind=tkind, window=int(window), horizon=horizon,
+        )
     else:
-        # Each component gets its own registered transform first, then combine
-        # folds them by the selected rule. Identical to what
-        # `run_test.py --combine` does, so the two agree by construction.
-        att = panel_mod.transform(signals.load_signal(att_name, px, kospi),
-                                  kind=att_t, window=int(window))
-        sen = panel_mod.transform(signals.load_signal(sen_name, px, kospi),
-                                  kind=sen_t, window=int(window))
-        if combine_rule == "linear_wf":
-            # The fit needs the target, so it happens here rather than inside
-            # combine, which never sees a forward return.
-            fwd = panel_mod.add_targets(px, kospi=kospi,
-                                        horizon=horizon)[f"fwd_ret_{horizon}"]
-            combine_weight = panel_mod.walk_forward_weight(att, sen, fwd,
-                                                           horizon=horizon)
-            wsum = panel_mod.weight_summary(combine_weight)
-        sig = panel_mod.combine(att, sen, window=int(window),
-                                rule=combine_rule, weight=combine_weight)
+        res = panel_mod.assemble_signal(
+            px, kospi,
+            att=signals.load_signal(att_name, px, kospi),
+            sen=signals.load_signal(sen_name, px, kospi),
+            combine_rule=combine_rule,
+            att_t=att_t, sen_t=sen_t,
+            combine_weight=combine_weight if combine_rule != "linear_wf" else None,
+            window=int(window), horizon=horizon,
+        )
 except FileNotFoundError as exc:
     # Hand-acquired sources (Naver .xlsx, GDELT backfill) are gitignored and
     # absent on a fresh clone. Their loaders raise with the recovery command;
@@ -248,8 +244,7 @@ except FileNotFoundError as exc:
     st.info("Pick another signal in the sidebar to carry on in the meantime.")
     st.stop()
 
-pnl = panel_mod.build_panel(px, sig, transform_kind=tkind, window=int(window),
-                            kospi=kospi, horizon=horizon)
+pnl = res.pnl
 
 fwd_col = f"{target}_{horizon}"
 res = stats.evaluate(pnl, horizon=horizon, target=target, q=quantiles)
@@ -314,9 +309,9 @@ with tab_describe:
     # It is the one thing on this tab estimated from forward returns, which is
     # why the caption says so - but only from returns already realised, so it
     # still cannot see the days it is used on.
-    if wsum is not None:
+    if res.wsum is not None:
         st.subheader("Fitted weight on sentiment")
-        if wsum["n"] == 0:
+        if res.wsum["n"] == 0:
             st.warning(
                 f"No weight could be fitted — fewer than {panel_mod.WF_MIN_OBS} "
                 "days have both signals and a realised forward return in this "
@@ -324,17 +319,17 @@ with tab_describe:
                 icon="📐")
         else:
             a_, b_, c_, d_ = st.columns(4)
-            a_.metric("Mean w", f"{wsum['mean']:+.3f}",
+            a_.metric("Mean w", f"{res.wsum['mean']:+.3f}",
                       help="Signed. 0 is attention alone.")
-            b_.metric("Range", f"{wsum['min']:+.2f} … {wsum['max']:+.2f}")
-            c_.metric("Clipped", f"{wsum['clipped']:.0%}",
+            b_.metric("Range", f"{res.wsum['min']:+.2f} … {res.wsum['max']:+.2f}")
+            c_.metric("Clipped", f"{res.wsum['clipped']:.0%}",
                       help=f"Days where |w| hit the ±{panel_mod.WF_CLIP:g} bound. "
                            "A high figure means the ratio is unstable and the "
                            "fitted weight should not be trusted.")
-            d_.metric("Fell back to 0", f"{wsum['zeroed']:.0%}",
+            d_.metric("Fell back to 0", f"{res.wsum['zeroed']:.0%}",
                       help="Days where the fitted attention coefficient was not "
                            "positive, so the weight reverts to attention alone.")
-            wser = combine_weight.dropna().rename("w").reset_index()
+            wser = res.weight.dropna().rename("w").reset_index()
             wser.columns = ["date", "w"]
             st.altair_chart(
                 styled(alt.Chart(wser).mark_line(color=SERIES, strokeWidth=1).encode(
@@ -344,7 +339,7 @@ with tab_describe:
                              alt.Tooltip("w:Q", title="w", format="+.3f")],
                 ).properties(title=f"Fitted weight — rolling "
                                    f"{panel_mod.WF_WINDOW}-observation OLS, first "
-                                   f"fit {wsum['first']:%Y-%m-%d}"), height=160),
+                                   f"fit {res.wsum['first']:%Y-%m-%d}"), height=160),
                 width="stretch")
             st.caption(
                 f"`w = β_sentiment / β_attention`, refitted every day on the most "
@@ -407,7 +402,7 @@ with tab_describe:
             "interaction if they largely measure the same thing; under `linear` "
             "a near-zero correlation is what makes the signed weight meaningful."
         )
-        corr = stats.signal_correlation(att, sen)
+        corr = stats.signal_correlation(res.att, res.sen)
         kc = st.columns(4)
         kc[0].metric("Pearson", f"{corr['pearson']:+.3f}",
                      help="No p-value: both series are autocorrelated, so a "
@@ -427,7 +422,7 @@ with tab_describe:
                        "measure the same thing, so the product is closer to a "
                        "square than to an interaction.", icon="⚠️")
 
-        pair = pd.concat([att.rename("a"), sen.rename("b")], axis=1).dropna().reset_index()
+        pair = pd.concat([res.att.rename("a"), res.sen.rename("b")], axis=1).dropna().reset_index()
         pair.columns = ["date", "a", "b"]
         psc = alt.Chart(pair).mark_circle(size=22, color=SERIES, opacity=0.4).encode(
             x=alt.X("a:Q", title=att_name, scale=alt.Scale(nice=True, zero=False)),
